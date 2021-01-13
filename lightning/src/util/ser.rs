@@ -18,6 +18,7 @@ use std::cmp;
 
 use bitcoin::secp256k1::Signature;
 use bitcoin::secp256k1::key::{PublicKey, SecretKey};
+use bitcoin::secp256k1::schnorrsig;
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxOut};
 use bitcoin::consensus;
@@ -541,6 +542,22 @@ impl Readable for PublicKey {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; 33] = Readable::read(r)?;
 		match PublicKey::from_slice(&buf) {
+			Ok(key) => Ok(key),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for schnorrsig::PublicKey {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		self.serialize().write(w)
+	}
+}
+
+impl Readable for schnorrsig::PublicKey {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; 33] = Readable::read(r)?;
+		match schnorrsig::PublicKey::from_slice(&buf) {
 			Ok(key) => Ok(key),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
