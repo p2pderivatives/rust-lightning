@@ -12,16 +12,18 @@ Utilities to manage Rust-Lightning channel data persistence and retrieval.
 unstable = ["lightning/unstable"]
 
 [dependencies]
-bitcoin = "0.26"
-lightning = { version = "0.0.13", path = "../lightning" }
+bitcoin = {version="0.26.0-adaptor.0", git = "https://github.com/p2pderivatives/rust-bitcoin", branch = "ecdsa-adaptor", package="bitcoin"}
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning" }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase"] }
 
 [dev-dependencies.bitcoin]
-version = "0.26"
+version = "0.26.0-adaptor.0"
+git = "https://github.com/p2pderivatives/rust-bitcoin"
+branch = "ecdsa-adaptor"
 features = ["bitcoinconsensus"]
 
 [dev-dependencies]
-lightning = { version = "0.0.13", path = "../lightning", features = ["_test_utils"] }
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning", features = ["_test_utils"] }

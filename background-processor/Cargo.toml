@@ -10,13 +10,15 @@ Utilities to perform required background tasks for Rust Lightning.
 edition = "2018"
 
 [dependencies]
-bitcoin = "0.26"
-lightning = { version = "0.0.13", path = "../lightning", features = ["allow_wallclock_use"] }
+bitcoin = {version="0.26.0-adaptor.0", git = "https://github.com/p2pderivatives/rust-bitcoin", branch = "ecdsa-adaptor", package="bitcoin"}
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning" }
 lightning-persister = { version = "0.0.13", path = "../lightning-persister" }
 
 [dev-dependencies]
-lightning = { version = "0.0.13", path = "../lightning", features = ["_test_utils"] }
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning", features = ["_test_utils"] }
 
 [dev-dependencies.bitcoin]
-version = "0.26"
+version = "0.26.0-adaptor.0"
+git = "https://github.com/p2pderivatives/rust-bitcoin"
+branch = "ecdsa-adaptor"
 features = ["bitcoinconsensus"]
