@@ -24,8 +24,9 @@ pub(crate) mod chacha20poly1305rfc;
 pub(crate) mod transaction_utils;
 pub(crate) mod scid_utils;
 
+/// Macros for serialization
 #[macro_use]
-pub(crate) mod ser_macros;
+pub mod ser_macros;
 
 /// Logging macro utilities.
 #[macro_use]

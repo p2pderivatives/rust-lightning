@@ -84,7 +84,7 @@ impl Writer for VecWriter {
 
 /// Writer that only tracks the amount of data written - useful if you need to calculate the length
 /// of some data when serialized but don't yet need the full data.
-pub(crate) struct LengthCalculatingWriter(pub usize);
+pub struct LengthCalculatingWriter(pub usize);
 impl Writer for LengthCalculatingWriter {
 	#[inline]
 	fn write_all(&mut self, buf: &[u8]) -> Result<(), ::std::io::Error> {
@@ -97,20 +97,23 @@ impl Writer for LengthCalculatingWriter {
 
 /// Essentially std::io::Take but a bit simpler and with a method to walk the underlying stream
 /// forward to ensure we always consume exactly the fixed length specified.
-pub(crate) struct FixedLengthReader<R: Read> {
+pub struct FixedLengthReader<R: Read> {
 	read: R,
 	bytes_read: u64,
 	total_bytes: u64,
 }
 impl<R: Read> FixedLengthReader<R> {
+	/// Create a new FixedLengthReader.
 	pub fn new(read: R, total_bytes: u64) -> Self {
 		Self { read, bytes_read: 0, total_bytes }
 	}
 
+	/// Whether the reader has remaining bytes to read.
 	pub fn bytes_remain(&mut self) -> bool {
 		self.bytes_read != self.total_bytes
 	}
 
+	/// Eat the remaining of the reader.
 	pub fn eat_remaining(&mut self) -> Result<(), DecodeError> {
 		::std::io::copy(self, &mut ::std::io::sink()).unwrap();
 		if self.bytes_read != self.total_bytes {
@@ -120,6 +123,7 @@ impl<R: Read> FixedLengthReader<R> {
 		}
 	}
 }
+
 impl<R: Read> Read for FixedLengthReader<R> {
 	fn read(&mut self, dest: &mut [u8]) -> Result<usize, ::std::io::Error> {
 		if self.total_bytes == self.bytes_read {
@@ -139,16 +143,23 @@ impl<R: Read> Read for FixedLengthReader<R> {
 
 /// A Read which tracks whether any bytes have been read at all. This allows us to distinguish
 /// between "EOF reached before we started" and "EOF reached mid-read".
-pub(crate) struct ReadTrackingReader<R: Read> {
+pub struct ReadTrackingReader<R: Read> {
 	read: R,
+	/// Whether any bytes have been read or not.
 	pub have_read: bool,
 }
+
+/// Implementation for ReadTrackingReader.
 impl<R: Read> ReadTrackingReader<R> {
+	/// Create a new ReadTrackingReader.
 	pub fn new(read: R) -> Self {
 		Self { read, have_read: false }
 	}
 }
+
+/// Implements the Read trait for ReadTrackingReader.
 impl<R: Read> Read for ReadTrackingReader<R> {
+	/// Read into the given buffer.
 	fn read(&mut self, dest: &mut [u8]) -> Result<usize, ::std::io::Error> {
 		match self.read.read(dest) {
 			Ok(0) => Ok(0),
@@ -244,7 +255,7 @@ impl Readable for U48 {
 /// encoded in several different ways, which we must check for at deserialization-time. Thus, if
 /// you're looking for an example of a variable-length integer to use for your own project, move
 /// along, this is a rather poor design.
-pub(crate) struct BigSize(pub u64);
+pub struct BigSize(pub u64);
 impl Writeable for BigSize {
 	#[inline]
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ::std::io::Error> {
