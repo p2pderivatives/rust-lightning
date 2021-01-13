@@ -437,6 +437,8 @@ impl_array!(16); // for IPv6
 impl_array!(32); // for channel id & hmac
 impl_array!(33); // for PublicKey
 impl_array!(64); // for Signature
+impl_array!(65); // for AdaptorSignature
+impl_array!(97); // for AdaptorProof
 impl_array!(1300); // for OnionPacket.hop_data
 
 // HashMap
