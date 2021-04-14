@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::cmp;
 
 use bitcoin::secp256k1::Signature;
+use bitcoin::secp256k1::constants::SCHNORRSIG_SIGNATURE_SIZE;
 use bitcoin::secp256k1::key::{PublicKey, SecretKey};
 use bitcoin::secp256k1::schnorrsig;
 use bitcoin::blockdata::script::Script;
@@ -491,6 +492,7 @@ impl Readable for Vec<u8> {
 		Ok(ret)
 	}
 }
+
 impl Writeable for Vec<Signature> {
 	#[inline]
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
@@ -514,6 +516,33 @@ impl Readable for Vec<Signature> {
 		}
 		let mut ret = Vec::with_capacity(len as usize);
 		for _ in 0..len { ret.push(Signature::read(r)?); }
+		Ok(ret)
+	}
+}
+
+impl Writeable for Vec<schnorrsig::Signature> {
+	#[inline]
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		(self.len() as u16).write(w)?;
+		for e in self.iter() {
+			e.write(w)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for Vec<schnorrsig::Signature> {
+	#[inline]
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let len: u16 = Readable::read(r)?;
+		let byte_size = (len as usize)
+		                .checked_mul(SCHNORRSIG_SIGNATURE_SIZE)
+		                .ok_or(DecodeError::BadLengthDescriptor)?;
+		if byte_size > MAX_BUF_SIZE {
+			return Err(DecodeError::BadLengthDescriptor);
+		}
+		let mut ret = Vec::with_capacity(len as usize);
+		for _ in 0..len { ret.push(schnorrsig::Signature::read(r)?); }
 		Ok(ret)
 	}
 }
@@ -609,6 +638,22 @@ impl Readable for Signature {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; 64] = Readable::read(r)?;
 		match Signature::from_compact(&buf) {
+			Ok(sig) => Ok(sig),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for schnorrsig::Signature {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		self.as_ref().write(w)
+	}
+}
+
+impl Readable for schnorrsig::Signature {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; 64] = Readable::read(r)?;
+		match schnorrsig::Signature::from_slice(&buf) {
 			Ok(sig) => Ok(sig),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
