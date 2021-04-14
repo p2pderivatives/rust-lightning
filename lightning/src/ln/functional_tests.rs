@@ -11,11 +11,12 @@
 //! payments/messages between them, and often checking the resulting ChannelMonitors are able to
 //! claim outputs on-chain.
 
+use chain;
 use chain::Watch;
 use chain::channelmonitor;
 use chain::channelmonitor::{ChannelMonitor, CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, ANTI_REORG_DELAY};
 use chain::transaction::OutPoint;
-use chain::keysinterface::{ChannelKeys, KeysInterface, SpendableOutputDescriptor};
+use chain::keysinterface::{Sign, KeysInterface};
 use ln::channel::{COMMITMENT_TX_BASE_WEIGHT, COMMITMENT_TX_WEIGHT_PER_HTLC};
 use ln::channelmanager::{ChannelManager, ChannelManagerReadArgs, RAACommitmentOrder, PaymentPreimage, PaymentHash, PaymentSecret, PaymentSendFailure, BREAKDOWN_TIMEOUT};
 use ln::channel::{Channel, ChannelError};
@@ -24,7 +25,7 @@ use routing::router::{Route, RouteHop, get_route};
 use ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use ln::msgs;
 use ln::msgs::{ChannelMessageHandler,RoutingMessageHandler,HTLCFailChannelUpdate, ErrorAction};
-use util::enforcing_trait_impls::EnforcingChannelKeys;
+use util::enforcing_trait_impls::EnforcingSigner;
 use util::{byte_utils, test_utils};
 use util::events::{Event, EventsProvider, MessageSendEvent, MessageSendEventsProvider};
 use util::errors::APIError;
@@ -33,12 +34,8 @@ use util::config::UserConfig;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hash_types::{Txid, BlockHash};
-use bitcoin::util::bip143;
-use bitcoin::util::address::Address;
-use bitcoin::util::bip32::{ChildNumber, ExtendedPubKey, ExtendedPrivKey};
 use bitcoin::blockdata::block::{Block, BlockHeader};
-use bitcoin::blockdata::transaction::{Transaction, TxOut, TxIn, SigHashType};
-use bitcoin::blockdata::script::{Builder, Script};
+use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::opcodes;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::network::constants::Network;
@@ -53,12 +50,12 @@ use regex;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::default::Default;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::mem;
 
 use ln::functional_test_utils::*;
 use ln::chan_utils::CommitmentTransaction;
+use ln::msgs::OptionalField::Present;
 
 #[test]
 fn test_insane_channel_opens() {
@@ -71,7 +68,7 @@ fn test_insane_channel_opens() {
 	// Instantiate channel parameters where we push the maximum msats given our
 	// funding satoshis
 	let channel_value_sat = 31337; // same as funding satoshis
-	let channel_reserve_satoshis = Channel::<EnforcingChannelKeys>::get_holder_selected_channel_reserve_satoshis(channel_value_sat);
+	let channel_reserve_satoshis = Channel::<EnforcingSigner>::get_holder_selected_channel_reserve_satoshis(channel_value_sat);
 	let push_msat = (channel_value_sat - channel_reserve_satoshis) * 1000;
 
 	// Have node0 initiate a channel to node1 with aforementioned parameters
@@ -168,7 +165,7 @@ fn test_async_inbound_update_fee() {
 	// ...but before it's delivered, nodes[1] starts to send a payment back to nodes[0]...
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-	nodes[1].node.send_payment(&get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 40000, TEST_FINAL_CLTV, &logger).unwrap(), our_payment_hash, &None).unwrap();
+	nodes[1].node.send_payment(&get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 40000, TEST_FINAL_CLTV, &logger).unwrap(), our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[1], 1);
 
 	let payment_event = {
@@ -266,7 +263,7 @@ fn test_update_fee_unordered_raa() {
 	// ...but before it's delivered, nodes[1] starts to send a payment back to nodes[0]...
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-	nodes[1].node.send_payment(&get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 40000, TEST_FINAL_CLTV, &logger).unwrap(), our_payment_hash, &None).unwrap();
+	nodes[1].node.send_payment(&get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 40000, TEST_FINAL_CLTV, &logger).unwrap(), our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[1], 1);
 
 	let payment_event = {
@@ -415,14 +412,10 @@ fn test_1_conf_open() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100000, 10001, InitFeatures::known(), InitFeatures::known());
-	let block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-		txdata: vec![tx],
-	};
-	connect_block(&nodes[1], &block, 1);
+	mine_transaction(&nodes[1], &tx);
 	nodes[0].node.handle_funding_locked(&nodes[1].node.get_our_node_id(), &get_event_msg!(nodes[1], MessageSendEvent::SendFundingLocked, nodes[0].node.get_our_node_id()));
 
-	connect_block(&nodes[0], &block, 1);
+	mine_transaction(&nodes[0], &tx);
 	let (funding_locked, _) = create_chan_between_nodes_with_value_confirm_second(&nodes[1], &nodes[0]);
 	let (announcement, as_update, bs_update) = create_chan_between_nodes_with_value_b(&nodes[0], &nodes[1], &funding_locked);
 
@@ -446,11 +439,11 @@ fn do_test_sanity_on_in_flight_opens(steps: u8) {
 
 	if steps & 0b1000_0000 != 0{
 		let block = Block {
-			header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+			header: BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 			txdata: vec![],
 		};
-		connect_block(&nodes[0], &block, 1);
-		connect_block(&nodes[1], &block, 1);
+		connect_block(&nodes[0], &block);
+		connect_block(&nodes[1], &block);
 	}
 
 	if steps & 0x0f == 0 { return; }
@@ -501,10 +494,11 @@ fn do_test_sanity_on_in_flight_opens(steps: u8) {
 	};
 
 	if steps & 0x0f == 6 { return; }
-	create_chan_between_nodes_with_value_confirm_first(&nodes[0], &nodes[1], &tx);
+	create_chan_between_nodes_with_value_confirm_first(&nodes[0], &nodes[1], &tx, 2);
 
 	if steps & 0x0f == 7 { return; }
-	confirm_transaction(&nodes[0], &tx);
+	confirm_transaction_at(&nodes[0], &tx, 2);
+	connect_blocks(&nodes[0], CHAN_CONFIRM_DEPTH);
 	create_chan_between_nodes_with_value_confirm_second(&nodes[1], &nodes[0]);
 }
 
@@ -653,7 +647,7 @@ fn test_update_fee_with_fundee_update_add_htlc() {
 
 	let (our_payment_preimage, our_payment_hash) = get_payment_preimage_hash!(nodes[1]);
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 800000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 800000, TEST_FINAL_CLTV, &logger).unwrap();
 
 	// nothing happens since node[1] is in AwaitingRemoteRevoke
 	nodes[1].node.send_payment(&route, our_payment_hash, &None).unwrap();
@@ -830,15 +824,14 @@ fn pre_funding_lock_shutdown_test() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 8000000, 0, InitFeatures::known(), InitFeatures::known());
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![tx.clone()]}, 1);
-	connect_block(&nodes[1], &Block { header, txdata: vec![tx.clone()]}, 1);
+	mine_transaction(&nodes[0], &tx);
+	mine_transaction(&nodes[1], &tx);
 
 	nodes[0].node.close_channel(&OutPoint { txid: tx.txid(), index: 0 }.to_channel_id()).unwrap();
 	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_shutdown);
 
 	let node_0_closing_signed = get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_closing_signed(&nodes[0].node.get_our_node_id(), &node_0_closing_signed);
@@ -866,9 +859,9 @@ fn updates_shutdown_wait() {
 
 	nodes[0].node.close_channel(&chan_1.2).unwrap();
 	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_shutdown);
 
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -877,8 +870,8 @@ fn updates_shutdown_wait() {
 
 	let net_graph_msg_handler0 = &nodes[0].net_graph_msg_handler;
 	let net_graph_msg_handler1 = &nodes[1].net_graph_msg_handler;
-	let route_1 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler0.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
-	let route_2 = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler1.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route_1 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler0.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route_2 = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler1.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	unwrap_send_err!(nodes[0].node.send_payment(&route_1, payment_hash, &None), true, APIError::ChannelUnavailable {..}, {});
 	unwrap_send_err!(nodes[1].node.send_payment(&route_2, payment_hash, &None), true, APIError::ChannelUnavailable {..}, {});
 
@@ -941,7 +934,7 @@ fn htlc_fail_async_shutdown() {
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -953,13 +946,13 @@ fn htlc_fail_async_shutdown() {
 
 	nodes[1].node.close_channel(&chan_1.2).unwrap();
 	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_shutdown);
 	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
 
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &updates.update_add_htlcs[0]);
 	nodes[1].node.handle_commitment_signed(&nodes[0].node.get_our_node_id(), &updates.commitment_signed);
 	check_added_monitors!(nodes[1], 1);
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	commitment_signed_dance!(nodes[1], nodes[0], (), false, true, false);
 
 	let updates_2 = get_htlc_update_msgs!(nodes[1], nodes[0].node.get_our_node_id());
@@ -1021,10 +1014,10 @@ fn do_test_shutdown_rebroadcast(recv_count: u8) {
 	nodes[1].node.close_channel(&chan_1.2).unwrap();
 	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
 	if recv_count > 0 {
-		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_shutdown);
+		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_shutdown);
 		let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
 		if recv_count > 1 {
-			nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+			nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 		}
 	}
 
@@ -1043,14 +1036,14 @@ fn do_test_shutdown_rebroadcast(recv_count: u8) {
 	nodes[0].node.handle_channel_reestablish(&nodes[1].node.get_our_node_id(), &node_1_reestablish);
 	let node_0_2nd_shutdown = if recv_count > 0 {
 		let node_0_2nd_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
-		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_2nd_shutdown);
+		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_2nd_shutdown);
 		node_0_2nd_shutdown
 	} else {
 		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
-		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_2nd_shutdown);
+		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_2nd_shutdown);
 		get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id())
 	};
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_2nd_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_2nd_shutdown);
 
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -1110,10 +1103,10 @@ fn do_test_shutdown_rebroadcast(recv_count: u8) {
 		let node_1_3rd_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
 		assert!(node_1_3rd_shutdown == node_1_2nd_shutdown);
 
-		nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_3rd_shutdown);
+		nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_3rd_shutdown);
 		assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
 
-		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_3rd_shutdown);
+		nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_1_3rd_shutdown);
 		let node_0_2nd_closing_signed = get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, nodes[1].node.get_our_node_id());
 		assert!(node_0_closing_signed == node_0_2nd_closing_signed);
 
@@ -1316,7 +1309,7 @@ fn holding_cell_htlc_counting() {
 	for _ in 0..::ln::channel::OUR_MAX_HTLCS {
 		let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[1].node.send_payment(&route, payment_hash, &None).unwrap();
 		payments.push((payment_preimage, payment_hash));
 	}
@@ -1333,7 +1326,7 @@ fn holding_cell_htlc_counting() {
 	let (_, payment_hash_1) = get_payment_preimage_hash!(nodes[0]);
 	{
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		unwrap_send_err!(nodes[1].node.send_payment(&route, payment_hash_1, &None), true, APIError::ChannelUnavailable { ref err },
 			assert!(regex::Regex::new(r"Cannot push more than their max accepted HTLCs \(\d+\)").unwrap().is_match(err)));
 		assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -1344,7 +1337,7 @@ fn holding_cell_htlc_counting() {
 	let (_, payment_hash_2) = get_payment_preimage_hash!(nodes[0]);
 	{
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, payment_hash_2, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 	}
@@ -1477,7 +1470,7 @@ fn test_duplicate_htlc_different_direction_onchain() {
 	let (payment_preimage, payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1])[..], 900_000);
 
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 800_000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 800_000, TEST_FINAL_CLTV, &logger).unwrap();
 	send_along_route_with_hash(&nodes[1], route, &vec!(&nodes[0])[..], 800_000, payment_hash);
 
 	// Provide preimage to node 0 by claiming payment
@@ -1498,8 +1491,7 @@ fn test_duplicate_htlc_different_direction_onchain() {
 	}
 	assert_eq!(has_both_htlcs, 2);
 
-	let header = BlockHeader { version: 0x2000_0000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![remote_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[0], &remote_txn[0]);
 	check_added_monitors!(nodes[0], 1);
 
 	// Check we only broadcast 1 timeout tx
@@ -1549,7 +1541,7 @@ fn test_basic_channel_reserve() {
 	let commit_tx_fee = 2 * commit_tx_fee_msat(get_feerate!(nodes[0], chan.2), 1 + 1);
 	let max_can_send = 5000000 - channel_reserve - commit_tx_fee;
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, &Vec::new(), max_can_send + 1, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), max_can_send + 1, TEST_FINAL_CLTV, &logger).unwrap();
 	let err = nodes[0].node.send_payment(&route, our_payment_hash, &None).err().unwrap();
 	match err {
 		PaymentSendFailure::AllFailedRetrySafe(ref fails) => {
@@ -1580,10 +1572,10 @@ fn test_fee_spike_violation_fails_htlc() {
 		($recv_value: expr) => {{
 			let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[1]);
 			let net_graph_msg_handler = &nodes[0].net_graph_msg_handler.network_graph.read().unwrap();
-			let route = get_route(&nodes[0].node.get_our_node_id(), net_graph_msg_handler, &nodes.last().unwrap().node.get_our_node_id(), None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[0].node.get_our_node_id(), net_graph_msg_handler, &nodes.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 			(route, payment_hash, payment_preimage)
 		}}
-	};
+	}
 
 	let (route, payment_hash, _) = get_route_and_payment_hash!(3460001);
 	// Need to manually create the update_add_htlc message to go around the channel reserve check in send_htlc()
@@ -1614,29 +1606,28 @@ fn test_fee_spike_violation_fails_htlc() {
 
 	const INITIAL_COMMITMENT_NUMBER: u64 = (1 << 48) - 1;
 
-	// Get the EnforcingChannelKeys for each channel, which will be used to (1) get the keys
+	// Get the EnforcingSigner for each channel, which will be used to (1) get the keys
 	// needed to sign the new commitment tx and (2) sign the new commitment tx.
-	let (local_revocation_basepoint, local_htlc_basepoint, local_secret, local_secret2) = {
+	let (local_revocation_basepoint, local_htlc_basepoint, local_secret, next_local_point) = {
 		let chan_lock = nodes[0].node.channel_state.lock().unwrap();
 		let local_chan = chan_lock.by_id.get(&chan.2).unwrap();
-		let chan_keys = local_chan.get_keys();
-		let pubkeys = chan_keys.pubkeys();
+		let chan_signer = local_chan.get_signer();
+		let pubkeys = chan_signer.pubkeys();
 		(pubkeys.revocation_basepoint, pubkeys.htlc_basepoint,
-		 chan_keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER), chan_keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER - 2))
+		 chan_signer.release_commitment_secret(INITIAL_COMMITMENT_NUMBER),
+		 chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 2, &secp_ctx))
 	};
-	let (remote_delayed_payment_basepoint, remote_htlc_basepoint, remote_secret1) = {
+	let (remote_delayed_payment_basepoint, remote_htlc_basepoint,remote_point) = {
 		let chan_lock = nodes[1].node.channel_state.lock().unwrap();
 		let remote_chan = chan_lock.by_id.get(&chan.2).unwrap();
-		let chan_keys = remote_chan.get_keys();
-		let pubkeys = chan_keys.pubkeys();
+		let chan_signer = remote_chan.get_signer();
+		let pubkeys = chan_signer.pubkeys();
 		(pubkeys.delayed_payment_basepoint, pubkeys.htlc_basepoint,
-		 chan_keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER - 1))
+		 chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 1, &secp_ctx))
 	};
 
 	// Assemble the set of keys we can use for signatures for our commitment_signed message.
-	let commitment_secret = SecretKey::from_slice(&remote_secret1).unwrap();
-	let per_commitment_point = PublicKey::from_secret_key(&secp_ctx, &commitment_secret);
-	let commit_tx_keys = chan_utils::TxCreationKeys::derive_new(&secp_ctx, &per_commitment_point, &remote_delayed_payment_basepoint,
+	let commit_tx_keys = chan_utils::TxCreationKeys::derive_new(&secp_ctx, &remote_point, &remote_delayed_payment_basepoint,
 		&remote_htlc_basepoint, &local_revocation_basepoint, &local_htlc_basepoint).unwrap();
 
 	// Build the remote commitment transaction so we can sign it, and then later use the
@@ -1656,7 +1647,7 @@ fn test_fee_spike_violation_fails_htlc() {
 	let res = {
 		let local_chan_lock = nodes[0].node.channel_state.lock().unwrap();
 		let local_chan = local_chan_lock.by_id.get(&chan.2).unwrap();
-		let local_chan_keys = local_chan.get_keys();
+		let local_chan_signer = local_chan.get_signer();
 		let commitment_tx = CommitmentTransaction::new_with_auxiliary_htlc_data(
 			commitment_number,
 			95000,
@@ -1666,7 +1657,7 @@ fn test_fee_spike_violation_fails_htlc() {
 			&mut vec![(accepted_htlc_info, ())],
 			&local_chan.channel_transaction_parameters.as_counterparty_broadcastable()
 		);
-		local_chan_keys.sign_counterparty_commitment(&commitment_tx, &secp_ctx).unwrap()
+		local_chan_signer.sign_counterparty_commitment(&commitment_tx, &secp_ctx).unwrap()
 	};
 
 	let commit_signed_msg = msgs::CommitmentSigned {
@@ -1680,10 +1671,11 @@ fn test_fee_spike_violation_fails_htlc() {
 	let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
 	// Send the RAA to nodes[1].
-	let per_commitment_secret = local_secret;
-	let next_secret = SecretKey::from_slice(&local_secret2).unwrap();
-	let next_per_commitment_point = PublicKey::from_secret_key(&secp_ctx, &next_secret);
-	let raa_msg = msgs::RevokeAndACK{ channel_id: chan.2, per_commitment_secret, next_per_commitment_point};
+	let raa_msg = msgs::RevokeAndACK {
+		channel_id: chan.2,
+		per_commitment_secret: local_secret,
+		next_per_commitment_point: next_local_point
+	};
 	nodes[1].node.handle_revoke_and_ack(&nodes[0].node.get_our_node_id(), &raa_msg);
 
 	let events = nodes[1].node.get_and_clear_pending_msg_events();
@@ -1705,8 +1697,9 @@ fn test_fee_spike_violation_fails_htlc() {
 fn test_chan_reserve_violation_outbound_htlc_inbound_chan() {
 	let mut chanmon_cfgs = create_chanmon_cfgs(2);
 	// Set the fee rate for the channel very high, to the point where the fundee
-	// sending any amount would result in a channel reserve violation. In this test
-	// we check that we would be prevented from sending an HTLC in this situation.
+	// sending any above-dust amount would result in a channel reserve violation.
+	// In this test we check that we would be prevented from sending an HTLC in
+	// this situation.
 	chanmon_cfgs[0].fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 6000 };
 	chanmon_cfgs[1].fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 6000 };
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
@@ -1719,12 +1712,12 @@ fn test_chan_reserve_violation_outbound_htlc_inbound_chan() {
 		($recv_value: expr) => {{
 			let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[1]);
 			let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-			let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.first().unwrap().node.get_our_node_id(), None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.first().unwrap().node.get_our_node_id(), None, None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 			(route, payment_hash, payment_preimage)
 		}}
-	};
+	}
 
-	let (route, our_payment_hash, _) = get_route_and_payment_hash!(1000);
+	let (route, our_payment_hash, _) = get_route_and_payment_hash!(4843000);
 	unwrap_send_err!(nodes[1].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
 		assert_eq!(err, "Cannot send value that would put counterparty balance under holder-announced channel reserve value"));
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -1751,10 +1744,10 @@ fn test_chan_reserve_violation_inbound_htlc_outbound_channel() {
 		($recv_value: expr) => {{
 			let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[1]);
 			let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-			let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.first().unwrap().node.get_our_node_id(), None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.first().unwrap().node.get_our_node_id(), None, None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 			(route, payment_hash, payment_preimage)
 		}}
-	};
+	}
 
 	let (route, payment_hash, _) = get_route_and_payment_hash!(1000);
 	// Need to manually create the update_add_htlc message to go around the channel reserve check in send_htlc()
@@ -1783,6 +1776,57 @@ fn test_chan_reserve_violation_inbound_htlc_outbound_channel() {
 }
 
 #[test]
+fn test_chan_reserve_dust_inbound_htlcs_outbound_chan() {
+	// Test that if we receive many dust HTLCs over an outbound channel, they don't count when
+	// calculating our commitment transaction fee (this was previously broken).
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None, None]);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	// Set nodes[0]'s balance such that they will consider any above-dust received HTLC to be a
+	// channel reserve violation (so their balance is channel reserve (1000 sats) + commitment
+	// transaction fee with 0 HTLCs (183 sats)).
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 98817000, InitFeatures::known(), InitFeatures::known());
+
+	let dust_amt = 546000; // Dust amount
+	// In the previous code, routing this dust payment would cause nodes[0] to perceive a channel
+	// reserve violation even though it's a dust HTLC and therefore shouldn't count towards the
+	// commitment transaction fee.
+	let (_, _) = route_payment(&nodes[1], &[&nodes[0]], dust_amt);
+}
+
+#[test]
+fn test_chan_reserve_dust_inbound_htlcs_inbound_chan() {
+	// Test that if we receive many dust HTLCs over an inbound channel, they don't count when
+	// calculating our counterparty's commitment transaction fee (this was previously broken).
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None, None]);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 98000000, InitFeatures::known(), InitFeatures::known());
+
+	let payment_amt = 46000; // Dust amount
+	// In the previous code, these first four payments would succeed.
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+
+	// Then these next 5 would be interpreted by nodes[1] as violating the fee spike buffer.
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+
+	// And this last payment previously resulted in nodes[1] closing on its inbound-channel
+	// counterparty, because it counted all the previous dust HTLCs against nodes[0]'s commitment
+	// transaction fee and therefore perceived this next payment as a channel reserve violation.
+	let (_, _) = route_payment(&nodes[0], &[&nodes[1]], payment_amt);
+}
+
+#[test]
 fn test_chan_reserve_violation_inbound_htlc_inbound_chan() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1796,10 +1840,10 @@ fn test_chan_reserve_violation_inbound_htlc_inbound_chan() {
 		($recv_value: expr) => {{
 			let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 			let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 			(route, payment_hash, payment_preimage)
 		}}
-	};
+	}
 
 	let feemsat = 239;
 	let total_routing_fee_msat = (nodes.len() - 2) as u64 * feemsat;
@@ -1897,10 +1941,10 @@ fn test_channel_reserve_holding_cell_htlcs() {
 		($recv_value: expr) => {{
 			let (payment_preimage, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 			let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), $recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 			(route, payment_hash, payment_preimage)
 		}}
-	};
+	}
 
 	macro_rules! expect_forward {
 		($node: expr) => {{
@@ -1920,7 +1964,8 @@ fn test_channel_reserve_holding_cell_htlcs() {
 
 	// attempt to send amt_msat > their_max_htlc_value_in_flight_msat
 	{
-		let (route, our_payment_hash, _) = get_route_and_payment_hash!(recv_value_0 + 1);
+		let (mut route, our_payment_hash, _) = get_route_and_payment_hash!(recv_value_0);
+		route.paths[0].last_mut().unwrap().fee_msat += 1;
 		assert!(route.paths[0].iter().rev().skip(1).all(|h| h.fee_msat == feemsat));
 		unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
 			assert!(regex::Regex::new(r"Cannot send value that would put us over the max HTLC value in flight our peer will accept \(\d+\)").unwrap().is_match(err)));
@@ -2093,23 +2138,6 @@ fn test_channel_reserve_holding_cell_htlcs() {
 
 	let commit_tx_fee_0_htlcs = 2*commit_tx_fee_msat(feerate, 1);
 	let recv_value_3 = commit_tx_fee_2_htlcs - commit_tx_fee_0_htlcs - total_fee_msat;
-	{
-		let (route, our_payment_hash, _) = get_route_and_payment_hash!(recv_value_3 + 1);
-		let err = nodes[0].node.send_payment(&route, our_payment_hash, &None).err().unwrap();
-		match err {
-			PaymentSendFailure::AllFailedRetrySafe(ref fails) => {
-				match &fails[0] {
-					&APIError::ChannelUnavailable{ref err} =>
-						assert!(regex::Regex::new(r"Cannot send value that would put our balance under counterparty-announced channel reserve value \(\d+\)").unwrap().is_match(err)),
-					_ => panic!("Unexpected error variant"),
-				}
-			},
-			_ => panic!("Unexpected error variant"),
-		}
-		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
-		nodes[0].logger.assert_log_contains("lightning::ln::channelmanager".to_string(), "Cannot send value that would put our balance under counterparty-announced channel reserve value".to_string(), 3);
-	}
-
 	send_payment(&nodes[0], &vec![&nodes[1], &nodes[2]][..], recv_value_3, recv_value_3);
 
 	let commit_tx_fee_1_htlc = 2*commit_tx_fee_msat(feerate, 1 + 1);
@@ -2162,7 +2190,7 @@ fn channel_reserve_in_flight_removes() {
 	let (payment_preimage_3, payment_hash_3) = get_payment_preimage_hash!(nodes[0]);
 	let send_1 = {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, payment_hash_3, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 		let mut events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -2235,7 +2263,7 @@ fn channel_reserve_in_flight_removes() {
 	let (payment_preimage_4, payment_hash_4) = get_payment_preimage_hash!(nodes[1]);
 	let send_2 = {
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &[], 10000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &[], 10000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[1].node.send_payment(&route, payment_hash_4, &None).unwrap();
 		check_added_monitors!(nodes[1], 1);
 		let mut events = nodes[1].node.get_and_clear_pending_msg_events();
@@ -2290,6 +2318,13 @@ fn channel_monitor_network_test() {
 	let chan_3 = create_announced_chan_between_nodes(&nodes, 2, 3, InitFeatures::known(), InitFeatures::known());
 	let chan_4 = create_announced_chan_between_nodes(&nodes, 3, 4, InitFeatures::known(), InitFeatures::known());
 
+	// Make sure all nodes are at the same starting height
+	connect_blocks(&nodes[0], 4*CHAN_CONFIRM_DEPTH + 1 - nodes[0].best_block_info().1);
+	connect_blocks(&nodes[1], 4*CHAN_CONFIRM_DEPTH + 1 - nodes[1].best_block_info().1);
+	connect_blocks(&nodes[2], 4*CHAN_CONFIRM_DEPTH + 1 - nodes[2].best_block_info().1);
+	connect_blocks(&nodes[3], 4*CHAN_CONFIRM_DEPTH + 1 - nodes[3].best_block_info().1);
+	connect_blocks(&nodes[4], 4*CHAN_CONFIRM_DEPTH + 1 - nodes[4].best_block_info().1);
+
 	// Rebalance the network a bit by relaying one payment through all the channels...
 	send_payment(&nodes[0], &vec!(&nodes[1], &nodes[2], &nodes[3], &nodes[4])[..], 8000000, 8_000_000);
 	send_payment(&nodes[0], &vec!(&nodes[1], &nodes[2], &nodes[3], &nodes[4])[..], 8000000, 8_000_000);
@@ -2301,8 +2336,8 @@ fn channel_monitor_network_test() {
 	check_added_monitors!(nodes[1], 1);
 	{
 		let mut node_txn = test_txn_broadcast(&nodes[1], &chan_1, None, HTLCType::NONE);
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[0], &Block { header, txdata: vec![node_txn.drain(..).next().unwrap()] }, 1);
+		assert_eq!(node_txn.len(), 1);
+		mine_transaction(&nodes[0], &node_txn[0]);
 		check_added_monitors!(nodes[0], 1);
 		test_txn_broadcast(&nodes[0], &chan_1, None, HTLCType::NONE);
 	}
@@ -2318,8 +2353,7 @@ fn channel_monitor_network_test() {
 	check_added_monitors!(nodes[1], 1);
 	{
 		let mut node_txn = test_txn_broadcast(&nodes[1], &chan_2, None, HTLCType::TIMEOUT);
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[2], &Block { header, txdata: vec![node_txn.drain(..).next().unwrap()] }, 1);
+		mine_transaction(&nodes[2], &node_txn[0]);
 		check_added_monitors!(nodes[2], 1);
 		test_txn_broadcast(&nodes[2], &chan_2, None, HTLCType::NONE);
 	}
@@ -2358,42 +2392,25 @@ fn channel_monitor_network_test() {
 
 		// Claim the payment on nodes[3], giving it knowledge of the preimage
 		claim_funds!(nodes[3], nodes[2], payment_preimage_1, 3_000_000);
-
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[3], &Block { header, txdata: vec![node_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[3], &node_txn[0]);
 		check_added_monitors!(nodes[3], 1);
-
 		check_preimage_claim(&nodes[3], &node_txn);
 	}
 	get_announce_close_broadcast_events(&nodes, 2, 3);
 	assert_eq!(nodes[2].node.list_channels().len(), 0);
 	assert_eq!(nodes[3].node.list_channels().len(), 1);
 
-	{ // Cheat and reset nodes[4]'s height to 1
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[4], &Block { header, txdata: vec![] }, 1);
-	}
+	// Drop the ChannelMonitor for the previous channel to avoid it broadcasting transactions and
+	// confusing us in the following tests.
+	let chan_3_mon = nodes[3].chain_monitor.chain_monitor.monitors.write().unwrap().remove(&OutPoint { txid: chan_3.3.txid(), index: 0 }).unwrap();
 
-	assert_eq!(nodes[3].node.latest_block_height.load(Ordering::Acquire), 1);
-	assert_eq!(nodes[4].node.latest_block_height.load(Ordering::Acquire), 1);
 	// One pending HTLC to time out:
 	let payment_preimage_2 = route_payment(&nodes[3], &vec!(&nodes[4])[..], 3000000).0;
 	// CLTV expires at TEST_FINAL_CLTV + 1 (current height) + 1 (added in send_payment for
 	// buffer space).
 
 	let (close_chan_update_1, close_chan_update_2) = {
-		let mut block = Block {
-			header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-			txdata: vec![],
-		};
-		connect_block(&nodes[3], &block, 2);
-		for i in 3..TEST_FINAL_CLTV + 2 + LATENCY_GRACE_PERIOD_BLOCKS + 1 {
-			block = Block {
-				header: BlockHeader { version: 0x20000000, prev_blockhash: block.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-				txdata: vec![],
-			};
-			connect_block(&nodes[3], &block, i);
-		}
+		connect_blocks(&nodes[3], TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + 1);
 		let events = nodes[3].node.get_and_clear_pending_msg_events();
 		assert_eq!(events.len(), 1);
 		let close_chan_update_1 = match events[0] {
@@ -2419,19 +2436,7 @@ fn channel_monitor_network_test() {
 		// Claim the payment on nodes[4], giving it knowledge of the preimage
 		claim_funds!(nodes[4], nodes[3], payment_preimage_2, 3_000_000);
 
-		block = Block {
-			header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-			txdata: vec![],
-		};
-
-		connect_block(&nodes[4], &block, 2);
-		for i in 3..TEST_FINAL_CLTV + 2 - CLTV_CLAIM_BUFFER + 1 {
-			block = Block {
-				header: BlockHeader { version: 0x20000000, prev_blockhash: block.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-				txdata: vec![],
-			};
-			connect_block(&nodes[4], &block, i);
-		}
+		connect_blocks(&nodes[4], TEST_FINAL_CLTV - CLTV_CLAIM_BUFFER + 2);
 		let events = nodes[4].node.get_and_clear_pending_msg_events();
 		assert_eq!(events.len(), 1);
 		let close_chan_update_2 = match events[0] {
@@ -2443,12 +2448,7 @@ fn channel_monitor_network_test() {
 		check_added_monitors!(nodes[4], 1);
 		test_txn_broadcast(&nodes[4], &chan_4, None, HTLCType::SUCCESS);
 
-		block = Block {
-			header: BlockHeader { version: 0x20000000, prev_blockhash: block.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-			txdata: vec![node_txn[0].clone()],
-		};
-		connect_block(&nodes[4], &block, TEST_FINAL_CLTV - 5);
-
+		mine_transaction(&nodes[4], &node_txn[0]);
 		check_preimage_claim(&nodes[4], &node_txn);
 		(close_chan_update_1, close_chan_update_2)
 	};
@@ -2456,6 +2456,8 @@ fn channel_monitor_network_test() {
 	nodes[4].net_graph_msg_handler.handle_channel_update(&close_chan_update_1).unwrap();
 	assert_eq!(nodes[3].node.list_channels().len(), 0);
 	assert_eq!(nodes[4].node.list_channels().len(), 0);
+
+	nodes[3].chain_monitor.chain_monitor.monitors.write().unwrap().insert(OutPoint { txid: chan_3.3.txid(), index: 0 }, chan_3_mon);
 }
 
 #[test]
@@ -2470,7 +2472,9 @@ fn test_justice_tx() {
 	bob_config.peer_channel_config_limits.force_announced_channel_preference = false;
 	bob_config.own_channel_config.our_to_self_delay = 6 * 24 * 3;
 	let user_cfgs = [Some(alice_config), Some(bob_config)];
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
+	chanmon_cfgs[1].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &user_cfgs);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -2492,8 +2496,7 @@ fn test_justice_tx() {
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage_3, 3_000_000);
 
 	{
-		let mut header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[1], &revoked_local_txn[0]);
 		{
 			let mut node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 			assert_eq!(node_txn.len(), 2); // ChannelMonitor: penalty tx, ChannelManager: local commitment tx
@@ -2506,13 +2509,12 @@ fn test_justice_tx() {
 		check_added_monitors!(nodes[1], 1);
 		test_txn_broadcast(&nodes[1], &chan_5, None, HTLCType::NONE);
 
-		connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[0], &revoked_local_txn[0]);
 		// Verify broadcast of revoked HTLC-timeout
 		let node_txn = test_txn_broadcast(&nodes[0], &chan_5, Some(revoked_local_txn[0].clone()), HTLCType::TIMEOUT);
-		header = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 		check_added_monitors!(nodes[0], 1);
 		// Broadcast revoked HTLC-timeout on node 1
-		connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[1].clone()] }, 1);
+		mine_transaction(&nodes[1], &node_txn[1]);
 		test_revoked_htlc_claim_txn_broadcast(&nodes[1], node_txn[1].clone(), revoked_local_txn[0].clone());
 	}
 	get_announce_close_broadcast_events(&nodes, 0, 1);
@@ -2539,8 +2541,7 @@ fn test_justice_tx() {
 	// Revoke the old state
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage_4, 3_000_000);
 	{
-		let mut header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[0], &revoked_local_txn[0]);
 		{
 			let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 			assert_eq!(node_txn.len(), 2); //ChannelMonitor: penalty tx, ChannelManager: local commitment tx
@@ -2552,11 +2553,10 @@ fn test_justice_tx() {
 		check_added_monitors!(nodes[0], 1);
 		test_txn_broadcast(&nodes[0], &chan_6, None, HTLCType::NONE);
 
-		connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[1], &revoked_local_txn[0]);
 		let node_txn = test_txn_broadcast(&nodes[1], &chan_6, Some(revoked_local_txn[0].clone()), HTLCType::SUCCESS);
-		header = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 		check_added_monitors!(nodes[1], 1);
-		connect_block(&nodes[0], &Block { header, txdata: vec![node_txn[1].clone()] }, 1);
+		mine_transaction(&nodes[0], &node_txn[1]);
 		test_revoked_htlc_claim_txn_broadcast(&nodes[0], node_txn[1].clone(), revoked_local_txn[0].clone());
 	}
 	get_announce_close_broadcast_events(&nodes, 0, 1);
@@ -2582,8 +2582,7 @@ fn revoked_output_claim() {
 	send_payment(&nodes[0], &vec!(&nodes[1])[..], 5000000, 5_000_000);
 
 	// Inform nodes[1] that nodes[0] broadcast a stale tx
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
 	check_added_monitors!(nodes[1], 1);
 	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 	assert_eq!(node_txn.len(), 2); // ChannelMonitor: justice tx against revoked to_local output, ChannelManager: local commitment tx
@@ -2592,7 +2591,7 @@ fn revoked_output_claim() {
 	check_spends!(node_txn[1], chan_1.3);
 
 	// Inform nodes[0] that a watchtower cheated on its behalf, so it will force-close the chan
-	connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[0], &revoked_local_txn[0]);
 	get_announce_close_broadcast_events(&nodes, 0, 1);
 	check_added_monitors!(nodes[0], 1)
 }
@@ -2600,7 +2599,8 @@ fn revoked_output_claim() {
 #[test]
 fn claim_htlc_outputs_shared_tx() {
 	// Node revoked old state, htlcs haven't time out yet, claim them in shared justice tx
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -2628,12 +2628,11 @@ fn claim_htlc_outputs_shared_tx() {
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage_1, 3_000_000);
 
 	{
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[0], &revoked_local_txn[0]);
 		check_added_monitors!(nodes[0], 1);
-		connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+		mine_transaction(&nodes[1], &revoked_local_txn[0]);
 		check_added_monitors!(nodes[1], 1);
-		connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+		connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 		expect_payment_failed!(nodes[1], payment_hash_2, true);
 
 		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
@@ -2670,7 +2669,8 @@ fn claim_htlc_outputs_shared_tx() {
 #[test]
 fn claim_htlc_outputs_single_tx() {
 	// Node revoked old state, htlcs have timed out, claim each of them in separated justice tx
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -2691,14 +2691,13 @@ fn claim_htlc_outputs_single_tx() {
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage_1, 3_000_000);
 
 	{
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 200);
+		confirm_transaction_at(&nodes[0], &revoked_local_txn[0], 100);
 		check_added_monitors!(nodes[0], 1);
-		connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 200);
+		confirm_transaction_at(&nodes[1], &revoked_local_txn[0], 100);
 		check_added_monitors!(nodes[1], 1);
 		expect_pending_htlcs_forwardable_ignore!(nodes[0]);
 
-		connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 200, true, header.block_hash());
+		connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 		expect_payment_failed!(nodes[1], payment_hash_2, true);
 
 		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
@@ -2709,25 +2708,25 @@ fn claim_htlc_outputs_single_tx() {
 		// ChannelMonitor: local commitment + local HTLC-timeout (2)
 
 		// Check the pair local commitment and HTLC-timeout broadcast due to HTLC expiration
-		assert_eq!(node_txn[2].input.len(), 1);
-		check_spends!(node_txn[2], chan_1.3);
-		assert_eq!(node_txn[3].input.len(), 1);
-		let witness_script = node_txn[3].input[0].witness.last().unwrap();
+		assert_eq!(node_txn[0].input.len(), 1);
+		check_spends!(node_txn[0], chan_1.3);
+		assert_eq!(node_txn[1].input.len(), 1);
+		let witness_script = node_txn[1].input[0].witness.last().unwrap();
 		assert_eq!(witness_script.len(), OFFERED_HTLC_SCRIPT_WEIGHT); //Spending an offered htlc output
-		check_spends!(node_txn[3], node_txn[2]);
+		check_spends!(node_txn[1], node_txn[0]);
 
 		// Justice transactions are indices 1-2-4
-		assert_eq!(node_txn[0].input.len(), 1);
-		assert_eq!(node_txn[1].input.len(), 1);
+		assert_eq!(node_txn[2].input.len(), 1);
+		assert_eq!(node_txn[3].input.len(), 1);
 		assert_eq!(node_txn[4].input.len(), 1);
 
-		check_spends!(node_txn[0], revoked_local_txn[0]);
-		check_spends!(node_txn[1], revoked_local_txn[0]);
+		check_spends!(node_txn[2], revoked_local_txn[0]);
+		check_spends!(node_txn[3], revoked_local_txn[0]);
 		check_spends!(node_txn[4], revoked_local_txn[0]);
 
 		let mut witness_lens = BTreeSet::new();
-		witness_lens.insert(node_txn[0].input[0].witness.last().unwrap().len());
-		witness_lens.insert(node_txn[1].input[0].witness.last().unwrap().len());
+		witness_lens.insert(node_txn[2].input[0].witness.last().unwrap().len());
+		witness_lens.insert(node_txn[3].input[0].witness.last().unwrap().len());
 		witness_lens.insert(node_txn[4].input[0].witness.last().unwrap().len());
 		assert_eq!(witness_lens.len(), 3);
 		assert_eq!(*witness_lens.iter().skip(0).next().unwrap(), 77); // revoked to_local
@@ -2770,7 +2769,6 @@ fn test_htlc_on_chain_success() {
 
 	let (our_payment_preimage, _payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1], &nodes[2]), 3000000);
 	let (our_payment_preimage_2, _payment_hash_2) = route_payment(&nodes[0], &vec!(&nodes[1], &nodes[2]), 3000000);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
 
 	// Broadcast legit commitment tx from C on B's chain
 	// Broadcast HTLC Success transaction by C on received output from C's commitment tx on B's chain
@@ -2786,7 +2784,7 @@ fn test_htlc_on_chain_success() {
 	assert!(updates.update_fail_malformed_htlcs.is_empty());
 	assert_eq!(updates.update_fulfill_htlcs.len(), 1);
 
-	connect_block(&nodes[2], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 1);
+	mine_transaction(&nodes[2], &commitment_tx[0]);
 	check_closed_broadcast!(nodes[2], false);
 	check_added_monitors!(nodes[2], 1);
 	let node_txn = nodes[2].tx_broadcaster.txn_broadcasted.lock().unwrap().clone(); // ChannelManager : 3 (commitment tx, 2*htlc-success tx), ChannelMonitor : 2 (2 * HTLC-Success tx)
@@ -2804,7 +2802,8 @@ fn test_htlc_on_chain_success() {
 	assert_eq!(node_txn[1].lock_time, 0);
 
 	// Verify that B's ChannelManager is able to extract preimage from HTLC Success tx and pass it backward
-	connect_block(&nodes[1], &Block { header, txdata: node_txn}, 1);
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
+	connect_block(&nodes[1], &Block { header, txdata: node_txn});
 	{
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 		assert_eq!(added_monitors.len(), 1);
@@ -2877,7 +2876,7 @@ fn test_htlc_on_chain_success() {
 	// Broadcast preimage tx by B on offered output from A commitment tx  on A's chain
 	let commitment_tx = get_local_commitment_txn!(nodes[0], chan_1.2);
 	check_spends!(commitment_tx[0], chan_1.3);
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 1);
+	mine_transaction(&nodes[1], &commitment_tx[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone(); // ChannelManager : 3 (commitment tx + HTLC-Sucess * 2), ChannelMonitor : 1 (HTLC-Success)
@@ -2896,7 +2895,8 @@ fn test_htlc_on_chain_success() {
 	// we already checked the same situation with A.
 
 	// Verify that A's ChannelManager is able to extract preimage from preimage tx and generate PaymentSent
-	connect_block(&nodes[0], &Block { header, txdata: vec![commitment_tx[0].clone(), node_txn[0].clone()] }, 1);
+	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
+	connect_block(&nodes[0], &Block { header, txdata: vec![commitment_tx[0].clone(), node_txn[0].clone()] });
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 	let events = nodes[0].node.get_and_clear_pending_events();
@@ -2942,7 +2942,6 @@ fn test_htlc_on_chain_timeout() {
 	send_payment(&nodes[0], &vec!(&nodes[1], &nodes[2])[..], 8000000, 8_000_000);
 
 	let (_payment_preimage, payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1], &nodes[2]), 3000000);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
 
 	// Broadcast legit commitment tx from C on B's chain
 	let commitment_tx = get_local_commitment_txn!(nodes[2], chan_2.2);
@@ -2964,7 +2963,7 @@ fn test_htlc_on_chain_timeout() {
 		},
 		_ => panic!("Unexpected event"),
 	};
-	connect_block(&nodes[2], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 1);
+	mine_transaction(&nodes[2], &commitment_tx[0]);
 	check_closed_broadcast!(nodes[2], false);
 	check_added_monitors!(nodes[2], 1);
 	let node_txn = nodes[2].tx_broadcaster.txn_broadcasted.lock().unwrap().clone(); // ChannelManager : 1 (commitment tx)
@@ -2974,30 +2973,44 @@ fn test_htlc_on_chain_timeout() {
 
 	// Broadcast timeout transaction by B on received output from C's commitment tx on B's chain
 	// Verify that B's ChannelManager is able to detect that HTLC is timeout by its own tx and react backward in consequence
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 200);
+	connect_blocks(&nodes[1], 200 - nodes[2].best_block_info().1);
+	mine_transaction(&nodes[1], &commitment_tx[0]);
 	let timeout_tx;
 	{
 		let mut node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		assert_eq!(node_txn.len(), 5); // ChannelManager : 2 (commitment tx, HTLC-Timeout tx), ChannelMonitor : 2 (local commitment tx + HTLC-timeout), 1 timeout tx
-		assert_eq!(node_txn[1], node_txn[3]);
-		assert_eq!(node_txn[2], node_txn[4]);
+		assert_eq!(node_txn[0], node_txn[3]);
+		assert_eq!(node_txn[1], node_txn[4]);
 
-		check_spends!(node_txn[0], commitment_tx[0]);
-		assert_eq!(node_txn[0].clone().input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
+		check_spends!(node_txn[2], commitment_tx[0]);
+		assert_eq!(node_txn[2].clone().input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
 
-		check_spends!(node_txn[1], chan_2.3);
-		check_spends!(node_txn[2], node_txn[1]);
-		assert_eq!(node_txn[1].clone().input[0].witness.last().unwrap().len(), 71);
-		assert_eq!(node_txn[2].clone().input[0].witness.last().unwrap().len(), OFFERED_HTLC_SCRIPT_WEIGHT);
+		check_spends!(node_txn[0], chan_2.3);
+		check_spends!(node_txn[1], node_txn[0]);
+		assert_eq!(node_txn[0].clone().input[0].witness.last().unwrap().len(), 71);
+		assert_eq!(node_txn[1].clone().input[0].witness.last().unwrap().len(), OFFERED_HTLC_SCRIPT_WEIGHT);
 
-		timeout_tx = node_txn[0].clone();
+		timeout_tx = node_txn[2].clone();
 		node_txn.clear();
 	}
 
-	connect_block(&nodes[1], &Block { header, txdata: vec![timeout_tx]}, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &timeout_tx);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_broadcast!(nodes[1], false);
+	{
+		// B will rebroadcast a fee-bumped timeout transaction here.
+		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
+		assert_eq!(node_txn.len(), 1);
+		check_spends!(node_txn[0], commitment_tx[0]);
+	}
+
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
+	{
+		// B will rebroadcast its own holder commitment transaction here...just because
+		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
+		assert_eq!(node_txn.len(), 1);
+		check_spends!(node_txn[0], chan_2.3);
+	}
 
 	expect_pending_htlcs_forwardable!(nodes[1]);
 	check_added_monitors!(nodes[1], 1);
@@ -3013,14 +3026,13 @@ fn test_htlc_on_chain_timeout() {
 		},
 		_ => panic!("Unexpected event"),
 	};
-	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone(); // Well... here we detect our own htlc_timeout_tx so no tx to be generated
-	assert_eq!(node_txn.len(), 0);
 
 	// Broadcast legit commitment tx from B on A's chain
 	let commitment_tx = get_local_commitment_txn!(nodes[1], chan_1.2);
 	check_spends!(commitment_tx[0], chan_1.3);
 
-	connect_block(&nodes[0], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 200);
+	mine_transaction(&nodes[0], &commitment_tx[0]);
+
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 	let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clone(); // ChannelManager : 2 (commitment tx, HTLC-Timeout tx), ChannelMonitor : 1 timeout tx
@@ -3055,9 +3067,8 @@ fn test_simple_commitment_revoked_fail_backward() {
 
 	let (_, payment_hash) = route_payment(&nodes[0], &[&nodes[1], &nodes[2]], 3000000);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_broadcast!(nodes[1], false);
 
@@ -3184,7 +3195,7 @@ fn do_test_commitment_revoked_fail_backward_exhaustive(deliver_bs_raa: bool, use
 	let (_, fourth_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[1].node.send_payment(&route, fourth_payment_hash, &None).unwrap();
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
@@ -3208,10 +3219,9 @@ fn do_test_commitment_revoked_fail_backward_exhaustive(deliver_bs_raa: bool, use
 	let mut failed_htlcs = HashSet::new();
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
 	check_added_monitors!(nodes[1], 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let events = nodes[1].node.get_and_clear_pending_events();
 	assert_eq!(events.len(), if deliver_bs_raa { 1 } else { 2 });
@@ -3330,7 +3340,7 @@ fn fail_backward_pending_htlc_upon_channel_failure() {
 	{
 		let (_, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 
@@ -3347,7 +3357,7 @@ fn fail_backward_pending_htlc_upon_channel_failure() {
 	let (_, failed_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	{
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, failed_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 0);
 
@@ -3362,7 +3372,7 @@ fn fail_backward_pending_htlc_upon_channel_failure() {
 		let session_priv = SecretKey::from_slice(&[42; 32]).unwrap();
 		let current_height = nodes[1].node.latest_block_height.load(Ordering::Acquire) as u32 + 1;
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 50_000, TEST_FINAL_CLTV, &logger).unwrap();
 		let (onion_payloads, _amount_msat, cltv_expiry) = onion_utils::build_onion_payloads(&route.paths[0], 50_000, &None, current_height).unwrap();
 		let onion_keys = onion_utils::construct_onion_keys(&secp_ctx, &route.paths[0], &session_priv).unwrap();
 		let onion_routing_packet = onion_utils::construct_onion_packet(onion_payloads, onion_keys, [0; 32], &payment_hash);
@@ -3396,21 +3406,22 @@ fn test_htlc_ignore_latest_remote_commitment() {
 	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 
 	route_payment(&nodes[0], &[&nodes[1]], 10000000);
-	nodes[0].node.force_close_channel(&nodes[0].node.list_channels()[0].channel_id);
+	nodes[0].node.force_close_channel(&nodes[0].node.list_channels()[0].channel_id).unwrap();
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
 	let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 	assert_eq!(node_txn.len(), 2);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[1].clone()]}, 1);
+	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[1].clone()]});
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
 	// Duplicate the connect_block call since this may happen due to other listeners
 	// registering new transactions
-	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[1].clone()]}, 1);
+	header.prev_blockhash = header.block_hash();
+	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[1].clone()]});
 }
 
 #[test]
@@ -3428,7 +3439,7 @@ fn test_force_close_fail_back() {
 
 	let mut payment_event = {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 1000000, 42, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 1000000, 42, &logger).unwrap();
 		nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 
@@ -3457,7 +3468,7 @@ fn test_force_close_fail_back() {
 	// state or updated nodes[1]' state. Now force-close and broadcast that commitment/HTLC
 	// transaction and ensure nodes[1] doesn't fail-backwards (this was originally a bug!).
 
-	nodes[2].node.force_close_channel(&payment_event.commitment_msg.channel_id);
+	nodes[2].node.force_close_channel(&payment_event.commitment_msg.channel_id).unwrap();
 	check_closed_broadcast!(nodes[2], false);
 	check_added_monitors!(nodes[2], 1);
 	let tx = {
@@ -3469,11 +3480,7 @@ fn test_force_close_fail_back() {
 		node_txn.remove(0)
 	};
 
-	let block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-		txdata: vec![tx.clone()],
-	};
-	connect_block(&nodes[1], &block, 1);
+	mine_transaction(&nodes[1], &tx);
 
 	// Note no UpdateHTLCs event here from nodes[1] to nodes[0]!
 	check_closed_broadcast!(nodes[1], false);
@@ -3481,11 +3488,11 @@ fn test_force_close_fail_back() {
 
 	// Now check that if we add the preimage to ChannelMonitor it broadcasts our HTLC-Success..
 	{
-		let mut monitors = nodes[2].chain_monitor.chain_monitor.monitors.lock().unwrap();
-		monitors.get_mut(&OutPoint{ txid: Txid::from_slice(&payment_event.commitment_msg.channel_id[..]).unwrap(), index: 0 }).unwrap()
+		let mut monitors = nodes[2].chain_monitor.chain_monitor.monitors.read().unwrap();
+		monitors.get(&OutPoint{ txid: Txid::from_slice(&payment_event.commitment_msg.channel_id[..]).unwrap(), index: 0 }).unwrap()
 			.provide_payment_preimage(&our_payment_hash, &our_payment_preimage, &node_cfgs[2].tx_broadcaster, &node_cfgs[2].fee_estimator, &&logger);
 	}
-	connect_block(&nodes[2], &block, 1);
+	mine_transaction(&nodes[2], &tx);
 	let node_txn = nodes[2].tx_broadcaster.txn_broadcasted.lock().unwrap();
 	assert_eq!(node_txn.len(), 1);
 	assert_eq!(node_txn[0].input.len(), 1);
@@ -3494,37 +3501,6 @@ fn test_force_close_fail_back() {
 	assert_eq!(node_txn[0].input[0].witness.len(), 5); // Must be an HTLC-Success
 
 	check_spends!(node_txn[0], tx);
-}
-
-#[test]
-fn test_unconf_chan() {
-	// After creating a chan between nodes, we disconnect all blocks previously seen to force a channel close on nodes[0] side
-	let chanmon_cfgs = create_chanmon_cfgs(2);
-	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
-
-	let channel_state = nodes[0].node.channel_state.lock().unwrap();
-	assert_eq!(channel_state.by_id.len(), 1);
-	assert_eq!(channel_state.short_to_id.len(), 1);
-	mem::drop(channel_state);
-
-	let mut headers = Vec::new();
-	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	headers.push(header.clone());
-	for _i in 2..100 {
-		header = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		headers.push(header.clone());
-	}
-	while !headers.is_empty() {
-		nodes[0].node.block_disconnected(&headers.pop().unwrap());
-	}
-	check_closed_broadcast!(nodes[0], false);
-	check_added_monitors!(nodes[0], 1);
-	let channel_state = nodes[0].node.channel_state.lock().unwrap();
-	assert_eq!(channel_state.by_id.len(), 0);
-	assert_eq!(channel_state.short_to_id.len(), 0);
 }
 
 #[test]
@@ -3603,7 +3579,7 @@ fn do_test_drop_messages_peer_disconnect(messages_delivered: u8) {
 	let payment_event = {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(),
-			&nodes[1].node.get_our_node_id(), Some(&nodes[0].node.list_usable_channels().iter().collect::<Vec<_>>()),
+			&nodes[1].node.get_our_node_id(), None, Some(&nodes[0].node.list_usable_channels().iter().collect::<Vec<_>>()),
 			&Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, payment_hash_1, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
@@ -3780,7 +3756,7 @@ fn do_test_drop_messages_peer_disconnect(messages_delivered: u8) {
 	// Channel should still work fine...
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(),
-		&nodes[1].node.get_our_node_id(), Some(&nodes[0].node.list_usable_channels().iter().collect::<Vec<_>>()),
+		&nodes[1].node.get_our_node_id(), None, Some(&nodes[0].node.list_usable_channels().iter().collect::<Vec<_>>()),
 		&Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	let payment_preimage_2 = send_along_route(&nodes[0], route, &[&nodes[1]], 1000000).0;
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage_2, 1_000_000);
@@ -3882,7 +3858,7 @@ fn test_funding_peer_disconnect() {
 
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	let (payment_preimage, _) = send_along_route(&nodes[0], route, &[&nodes[1]], 1000000);
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage, 1_000_000);
 }
@@ -3903,7 +3879,7 @@ fn test_drop_messages_peer_disconnect_dual_htlc() {
 	// Now try to send a second payment which will fail to send
 	let (payment_preimage_2, payment_hash_2) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, payment_hash_2, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
@@ -4044,12 +4020,13 @@ fn do_test_htlc_timeout(send_partial_mpp: bool) {
 
 	let our_payment_hash = if send_partial_mpp {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		let (_, our_payment_hash) = get_payment_preimage_hash!(&nodes[0]);
 		let payment_secret = PaymentSecret([0xdb; 32]);
 		// Use the utility function send_payment_along_path to send the payment with MPP data which
 		// indicates there are more HTLCs coming.
-		nodes[0].node.send_payment_along_path(&route.paths[0], &our_payment_hash, &Some(payment_secret), 200000, CHAN_CONFIRM_DEPTH).unwrap();
+		let cur_height = CHAN_CONFIRM_DEPTH + 1; // route_payment calls send_payment, which adds 1 to the current height. So we do the same here to match.
+		nodes[0].node.send_payment_along_path(&route.paths[0], &our_payment_hash, &Some(payment_secret), 200000, cur_height).unwrap();
 		check_added_monitors!(nodes[0], 1);
 		let mut events = nodes[0].node.get_and_clear_pending_msg_events();
 		assert_eq!(events.len(), 1);
@@ -4062,15 +4039,15 @@ fn do_test_htlc_timeout(send_partial_mpp: bool) {
 	};
 
 	let mut block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+		header: BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 		txdata: vec![],
 	};
-	connect_block(&nodes[0], &block, 101);
-	connect_block(&nodes[1], &block, 101);
-	for i in 102..TEST_FINAL_CLTV + 100 + 1 - CLTV_CLAIM_BUFFER - LATENCY_GRACE_PERIOD_BLOCKS {
+	connect_block(&nodes[0], &block);
+	connect_block(&nodes[1], &block);
+	for _ in CHAN_CONFIRM_DEPTH + 2 ..TEST_FINAL_CLTV + CHAN_CONFIRM_DEPTH + 2 - CLTV_CLAIM_BUFFER - LATENCY_GRACE_PERIOD_BLOCKS {
 		block.header.prev_blockhash = block.block_hash();
-		connect_block(&nodes[0], &block, i);
-		connect_block(&nodes[1], &block, i);
+		connect_block(&nodes[0], &block);
+		connect_block(&nodes[1], &block);
 	}
 
 	expect_pending_htlcs_forwardable!(nodes[1]);
@@ -4084,9 +4061,9 @@ fn do_test_htlc_timeout(send_partial_mpp: bool) {
 
 	nodes[0].node.handle_update_fail_htlc(&nodes[1].node.get_our_node_id(), &htlc_timeout_updates.update_fail_htlcs[0]);
 	commitment_signed_dance!(nodes[0], nodes[1], htlc_timeout_updates.commitment_signed, false);
-	// 100_000 msat as u64, followed by a height of 123 as u32
+	// 100_000 msat as u64, followed by a height of TEST_FINAL_CLTV + 2 as u32
 	let mut expected_failure_data = byte_utils::be64_to_array(100_000).to_vec();
-	expected_failure_data.extend_from_slice(&byte_utils::be32_to_array(123));
+	expected_failure_data.extend_from_slice(&byte_utils::be32_to_array(TEST_FINAL_CLTV + 2));
 	expect_payment_failed!(nodes[0], our_payment_hash, true, 0x4000 | 15, &expected_failure_data[..]);
 }
 
@@ -4104,13 +4081,19 @@ fn do_test_holding_cell_htlc_add_timeouts(forwarded_htlc: bool) {
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 	create_announced_chan_between_nodes(&nodes, 1, 2, InitFeatures::known(), InitFeatures::known());
+
+	// Make sure all nodes are at the same starting height
+	connect_blocks(&nodes[0], 2*CHAN_CONFIRM_DEPTH + 1 - nodes[0].best_block_info().1);
+	connect_blocks(&nodes[1], 2*CHAN_CONFIRM_DEPTH + 1 - nodes[1].best_block_info().1);
+	connect_blocks(&nodes[2], 2*CHAN_CONFIRM_DEPTH + 1 - nodes[2].best_block_info().1);
+
 	let logger = test_utils::TestLogger::new();
 
 	// Route a first payment to get the 1 -> 2 channel in awaiting_raa...
 	let (_, first_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	{
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[1].node.send_payment(&route, first_payment_hash, &None).unwrap();
 	}
 	assert_eq!(nodes[1].node.get_and_clear_pending_msg_events().len(), 1);
@@ -4120,7 +4103,7 @@ fn do_test_holding_cell_htlc_add_timeouts(forwarded_htlc: bool) {
 	let (_, second_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	if forwarded_htlc {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, second_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 		let payment_event = SendEvent::from_event(nodes[0].node.get_and_clear_pending_msg_events().remove(0));
@@ -4130,26 +4113,15 @@ fn do_test_holding_cell_htlc_add_timeouts(forwarded_htlc: bool) {
 		check_added_monitors!(nodes[1], 0);
 	} else {
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[1].node.send_payment(&route, second_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[1], 0);
 	}
 
-	let mut block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-		txdata: vec![],
-	};
-	connect_block(&nodes[1], &block, 101);
-	for i in 102..TEST_FINAL_CLTV + 100 - CLTV_CLAIM_BUFFER - LATENCY_GRACE_PERIOD_BLOCKS {
-		block.header.prev_blockhash = block.block_hash();
-		connect_block(&nodes[1], &block, i);
-	}
-
+	connect_blocks(&nodes[1], TEST_FINAL_CLTV - CLTV_CLAIM_BUFFER - LATENCY_GRACE_PERIOD_BLOCKS);
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
-
-	block.header.prev_blockhash = block.block_hash();
-	connect_block(&nodes[1], &block, TEST_FINAL_CLTV + 100 - CLTV_CLAIM_BUFFER - LATENCY_GRACE_PERIOD_BLOCKS);
+	connect_blocks(&nodes[1], 1);
 
 	if forwarded_htlc {
 		expect_pending_htlcs_forwardable!(nodes[1]);
@@ -4201,8 +4173,8 @@ fn test_invalid_channel_announcement() {
 
 	nodes[0].net_graph_msg_handler.handle_htlc_fail_channel_update(&msgs::HTLCFailChannelUpdate::ChannelClosed { short_channel_id : as_chan.get_short_channel_id().unwrap(), is_permanent: false } );
 
-	let as_bitcoin_key = as_chan.get_keys().inner.holder_channel_pubkeys.funding_pubkey;
-	let bs_bitcoin_key = bs_chan.get_keys().inner.holder_channel_pubkeys.funding_pubkey;
+	let as_bitcoin_key = as_chan.get_signer().inner.holder_channel_pubkeys.funding_pubkey;
+	let bs_bitcoin_key = bs_chan.get_signer().inner.holder_channel_pubkeys.funding_pubkey;
 
 	let as_network_key = nodes[0].node.get_our_node_id();
 	let bs_network_key = nodes[1].node.get_our_node_id();
@@ -4229,8 +4201,8 @@ fn test_invalid_channel_announcement() {
 	macro_rules! sign_msg {
 		($unsigned_msg: expr) => {
 			let msghash = Message::from_slice(&Sha256dHash::hash(&$unsigned_msg.encode()[..])[..]).unwrap();
-			let as_bitcoin_sig = secp_ctx.sign(&msghash, &as_chan.get_keys().inner.funding_key);
-			let bs_bitcoin_sig = secp_ctx.sign(&msghash, &bs_chan.get_keys().inner.funding_key);
+			let as_bitcoin_sig = secp_ctx.sign(&msghash, &as_chan.get_signer().inner.funding_key);
+			let bs_bitcoin_sig = secp_ctx.sign(&msghash, &bs_chan.get_signer().inner.funding_key);
 			let as_node_sig = secp_ctx.sign(&msghash, &nodes[0].keys_manager.get_node_secret());
 			let bs_node_sig = secp_ctx.sign(&msghash, &nodes[1].keys_manager.get_node_secret());
 			chan_announcement = msgs::ChannelAnnouncement {
@@ -4269,8 +4241,7 @@ fn test_no_txn_manager_serialize_deserialize() {
 	let fee_estimator: test_utils::TestFeeEstimator;
 	let persister: test_utils::TestPersister;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let keys_manager: test_utils::TestKeysInterface;
-	let nodes_0_deserialized: ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_0_deserialized: ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100000, 10001, InitFeatures::known(), InitFeatures::known());
@@ -4279,17 +4250,17 @@ fn test_no_txn_manager_serialize_deserialize() {
 
 	let nodes_0_serialized = nodes[0].node.encode();
 	let mut chan_0_monitor_serialized = test_utils::TestVecWriter(Vec::new());
-	nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
+	nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
 
 	logger = test_utils::TestLogger::new();
 	fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 	persister = test_utils::TestPersister::new();
-	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister);
+	let keys_manager = &chanmon_cfgs[0].keys_manager;
+	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister, keys_manager);
 	nodes[0].chain_monitor = &new_chain_monitor;
-	keys_manager = test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet);
 	let mut chan_0_monitor_read = &chan_0_monitor_serialized.0[..];
-	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(
-		&mut chan_0_monitor_read, &keys_manager).unwrap();
+	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(
+		&mut chan_0_monitor_read, keys_manager).unwrap();
 	assert!(chan_0_monitor_read.is_empty());
 
 	let mut nodes_0_read = &nodes_0_serialized[..];
@@ -4297,9 +4268,9 @@ fn test_no_txn_manager_serialize_deserialize() {
 	let (_, nodes_0_deserialized_tmp) = {
 		let mut channel_monitors = HashMap::new();
 		channel_monitors.insert(chan_0_monitor.get_funding_txo().0, &mut chan_0_monitor);
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
 			default_config: config,
-			keys_manager: &keys_manager,
+			keys_manager,
 			fee_estimator: &fee_estimator,
 			chain_monitor: nodes[0].chain_monitor,
 			tx_broadcaster: nodes[0].tx_broadcaster.clone(),
@@ -4346,8 +4317,7 @@ fn test_manager_serialize_deserialize_events() {
 	let persister: test_utils::TestPersister;
 	let logger: test_utils::TestLogger;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let keys_manager: test_utils::TestKeysInterface;
-	let nodes_0_deserialized: ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_0_deserialized: ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	// Start creating a channel, but stop right before broadcasting the event message FundingBroadcastSafe
@@ -4355,8 +4325,8 @@ fn test_manager_serialize_deserialize_events() {
 	let push_msat = 10001;
 	let a_flags = InitFeatures::known();
 	let b_flags = InitFeatures::known();
-	let node_a = nodes.pop().unwrap();
-	let node_b = nodes.pop().unwrap();
+	let node_a = nodes.remove(0);
+	let node_b = nodes.remove(0);
 	node_a.node.create_channel(node_b.node.get_our_node_id(), channel_value, push_msat, 42, None).unwrap();
 	node_b.node.handle_open_channel(&node_a.node.get_our_node_id(), a_flags, &get_event_msg!(node_a, MessageSendEvent::SendOpenChannel, node_b.node.get_our_node_id()));
 	node_a.node.handle_accept_channel(&node_b.node.get_our_node_id(), b_flags, &get_event_msg!(node_b, MessageSendEvent::SendAcceptChannel, node_a.node.get_our_node_id()));
@@ -4389,17 +4359,17 @@ fn test_manager_serialize_deserialize_events() {
 	// Start the de/seriailization process mid-channel creation to check that the channel manager will hold onto events that are serialized
 	let nodes_0_serialized = nodes[0].node.encode();
 	let mut chan_0_monitor_serialized = test_utils::TestVecWriter(Vec::new());
-	nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
+	nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
 
 	fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 	logger = test_utils::TestLogger::new();
 	persister = test_utils::TestPersister::new();
-	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister);
-	keys_manager = test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet);
+	let keys_manager = &chanmon_cfgs[0].keys_manager;
+	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister, keys_manager);
 	nodes[0].chain_monitor = &new_chain_monitor;
 	let mut chan_0_monitor_read = &chan_0_monitor_serialized.0[..];
-	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(
-		&mut chan_0_monitor_read, &keys_manager).unwrap();
+	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(
+		&mut chan_0_monitor_read, keys_manager).unwrap();
 	assert!(chan_0_monitor_read.is_empty());
 
 	let mut nodes_0_read = &nodes_0_serialized[..];
@@ -4407,9 +4377,9 @@ fn test_manager_serialize_deserialize_events() {
 	let (_, nodes_0_deserialized_tmp) = {
 		let mut channel_monitors = HashMap::new();
 		channel_monitors.insert(chan_0_monitor.get_funding_txo().0, &mut chan_0_monitor);
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
 			default_config: config,
-			keys_manager: &keys_manager,
+			keys_manager,
 			fee_estimator: &fee_estimator,
 			chain_monitor: nodes[0].chain_monitor,
 			tx_broadcaster: nodes[0].tx_broadcaster.clone(),
@@ -4470,8 +4440,7 @@ fn test_simple_manager_serialize_deserialize() {
 	let fee_estimator: test_utils::TestFeeEstimator;
 	let persister: test_utils::TestPersister;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let keys_manager: test_utils::TestKeysInterface;
-	let nodes_0_deserialized: ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_0_deserialized: ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 
@@ -4482,26 +4451,26 @@ fn test_simple_manager_serialize_deserialize() {
 
 	let nodes_0_serialized = nodes[0].node.encode();
 	let mut chan_0_monitor_serialized = test_utils::TestVecWriter(Vec::new());
-	nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
+	nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter().next().unwrap().1.write(&mut chan_0_monitor_serialized).unwrap();
 
 	logger = test_utils::TestLogger::new();
 	fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 	persister = test_utils::TestPersister::new();
-	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister);
-	keys_manager = test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet);
+	let keys_manager = &chanmon_cfgs[0].keys_manager;
+	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister, keys_manager);
 	nodes[0].chain_monitor = &new_chain_monitor;
 	let mut chan_0_monitor_read = &chan_0_monitor_serialized.0[..];
-	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(
-		&mut chan_0_monitor_read, &keys_manager).unwrap();
+	let (_, mut chan_0_monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(
+		&mut chan_0_monitor_read, keys_manager).unwrap();
 	assert!(chan_0_monitor_read.is_empty());
 
 	let mut nodes_0_read = &nodes_0_serialized[..];
 	let (_, nodes_0_deserialized_tmp) = {
 		let mut channel_monitors = HashMap::new();
 		channel_monitors.insert(chan_0_monitor.get_funding_txo().0, &mut chan_0_monitor);
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
 			default_config: UserConfig::default(),
-			keys_manager: &keys_manager,
+			keys_manager,
 			fee_estimator: &fee_estimator,
 			chain_monitor: nodes[0].chain_monitor,
 			tx_broadcaster: nodes[0].tx_broadcaster.clone(),
@@ -4532,15 +4501,14 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	let fee_estimator: test_utils::TestFeeEstimator;
 	let persister: test_utils::TestPersister;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let keys_manager: test_utils::TestKeysInterface;
-	let nodes_0_deserialized: ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_0_deserialized: ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
 	let mut nodes = create_network(4, &node_cfgs, &node_chanmgrs);
 	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 	create_announced_chan_between_nodes(&nodes, 2, 0, InitFeatures::known(), InitFeatures::known());
 	let (_, _, channel_id, funding_tx) = create_announced_chan_between_nodes(&nodes, 0, 3, InitFeatures::known(), InitFeatures::known());
 
 	let mut node_0_stale_monitors_serialized = Vec::new();
-	for monitor in nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter() {
+	for monitor in nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter() {
 		let mut writer = test_utils::TestVecWriter(Vec::new());
 		monitor.1.write(&mut writer).unwrap();
 		node_0_stale_monitors_serialized.push(writer.0);
@@ -4559,7 +4527,7 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	// Now the ChannelMonitor (which is now out-of-sync with ChannelManager for channel w/
 	// nodes[3])
 	let mut node_0_monitors_serialized = Vec::new();
-	for monitor in nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter() {
+	for monitor in nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter() {
 		let mut writer = test_utils::TestVecWriter(Vec::new());
 		monitor.1.write(&mut writer).unwrap();
 		node_0_monitors_serialized.push(writer.0);
@@ -4568,15 +4536,15 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	logger = test_utils::TestLogger::new();
 	fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 	persister = test_utils::TestPersister::new();
-	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister);
+	let keys_manager = &chanmon_cfgs[0].keys_manager;
+	new_chain_monitor = test_utils::TestChainMonitor::new(Some(nodes[0].chain_source), nodes[0].tx_broadcaster.clone(), &logger, &fee_estimator, &persister, keys_manager);
 	nodes[0].chain_monitor = &new_chain_monitor;
 
-	keys_manager = test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet);
 
 	let mut node_0_stale_monitors = Vec::new();
 	for serialized in node_0_stale_monitors_serialized.iter() {
 		let mut read = &serialized[..];
-		let (_, monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut read, &keys_manager).unwrap();
+		let (_, monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut read, keys_manager).unwrap();
 		assert!(read.is_empty());
 		node_0_stale_monitors.push(monitor);
 	}
@@ -4584,16 +4552,16 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	let mut node_0_monitors = Vec::new();
 	for serialized in node_0_monitors_serialized.iter() {
 		let mut read = &serialized[..];
-		let (_, monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut read, &keys_manager).unwrap();
+		let (_, monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut read, keys_manager).unwrap();
 		assert!(read.is_empty());
 		node_0_monitors.push(monitor);
 	}
 
 	let mut nodes_0_read = &nodes_0_serialized[..];
 	if let Err(msgs::DecodeError::InvalidValue) =
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
 		default_config: UserConfig::default(),
-		keys_manager: &keys_manager,
+		keys_manager,
 		fee_estimator: &fee_estimator,
 		chain_monitor: nodes[0].chain_monitor,
 		tx_broadcaster: nodes[0].tx_broadcaster.clone(),
@@ -4605,9 +4573,9 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 
 	let mut nodes_0_read = &nodes_0_serialized[..];
 	let (_, nodes_0_deserialized_tmp) =
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut nodes_0_read, ChannelManagerReadArgs {
 		default_config: UserConfig::default(),
-		keys_manager: &keys_manager,
+		keys_manager,
 		fee_estimator: &fee_estimator,
 		chain_monitor: nodes[0].chain_monitor,
 		tx_broadcaster: nodes[0].tx_broadcaster.clone(),
@@ -4655,119 +4623,25 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 macro_rules! check_spendable_outputs {
 	($node: expr, $der_idx: expr, $keysinterface: expr, $chan_value: expr) => {
 		{
-			let events = $node.chain_monitor.chain_monitor.get_and_clear_pending_events();
+			let mut events = $node.chain_monitor.chain_monitor.get_and_clear_pending_events();
 			let mut txn = Vec::new();
-			for event in events {
+			let mut all_outputs = Vec::new();
+			let secp_ctx = Secp256k1::new();
+			for event in events.drain(..) {
 				match event {
-					Event::SpendableOutputs { ref outputs } => {
-						for outp in outputs {
-							match *outp {
-								SpendableOutputDescriptor::StaticOutputCounterpartyPayment { ref outpoint, ref output, ref key_derivation_params } => {
-									let input = TxIn {
-										previous_output: outpoint.into_bitcoin_outpoint(),
-										script_sig: Script::new(),
-										sequence: 0,
-										witness: Vec::new(),
-									};
-									let outp = TxOut {
-										script_pubkey: Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script(),
-										value: output.value,
-									};
-									let mut spend_tx = Transaction {
-										version: 2,
-										lock_time: 0,
-										input: vec![input],
-										output: vec![outp],
-									};
-									spend_tx.output[0].value -= (spend_tx.get_weight() + 2 + 1 + 73 + 35 + 3) as u64 / 4; // (Max weight + 3 (to round up)) / 4
-									let secp_ctx = Secp256k1::new();
-									let keys = $keysinterface.derive_channel_keys($chan_value, key_derivation_params.0, key_derivation_params.1);
-									let remotepubkey = keys.pubkeys().payment_point;
-									let witness_script = Address::p2pkh(&::bitcoin::PublicKey{compressed: true, key: remotepubkey}, Network::Testnet).script_pubkey();
-									let sighash = Message::from_slice(&bip143::SigHashCache::new(&spend_tx).signature_hash(0, &witness_script, output.value, SigHashType::All)[..]).unwrap();
-									let remotesig = secp_ctx.sign(&sighash, &keys.inner.payment_key);
-									spend_tx.input[0].witness.push(remotesig.serialize_der().to_vec());
-									spend_tx.input[0].witness[0].push(SigHashType::All as u8);
-									spend_tx.input[0].witness.push(remotepubkey.serialize().to_vec());
-									txn.push(spend_tx);
-								},
-								SpendableOutputDescriptor::DynamicOutputP2WSH { ref outpoint, ref per_commitment_point, ref to_self_delay, ref output, ref key_derivation_params, ref revocation_pubkey } => {
-									let input = TxIn {
-										previous_output: outpoint.into_bitcoin_outpoint(),
-										script_sig: Script::new(),
-										sequence: *to_self_delay as u32,
-										witness: Vec::new(),
-									};
-									let outp = TxOut {
-										script_pubkey: Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script(),
-										value: output.value,
-									};
-									let mut spend_tx = Transaction {
-										version: 2,
-										lock_time: 0,
-										input: vec![input],
-										output: vec![outp],
-									};
-									let secp_ctx = Secp256k1::new();
-									let keys = $keysinterface.derive_channel_keys($chan_value, key_derivation_params.0, key_derivation_params.1);
-									if let Ok(delayed_payment_key) = chan_utils::derive_private_key(&secp_ctx, &per_commitment_point, &keys.inner.delayed_payment_base_key) {
-
-										let delayed_payment_pubkey = PublicKey::from_secret_key(&secp_ctx, &delayed_payment_key);
-										let witness_script = chan_utils::get_revokeable_redeemscript(revocation_pubkey, *to_self_delay, &delayed_payment_pubkey);
-										spend_tx.output[0].value -= (spend_tx.get_weight() + 2 + 1 + 73 + 1 + witness_script.len() + 1 + 3) as u64 / 4; // (Max weight + 3 (to round up)) / 4
-										let sighash = Message::from_slice(&bip143::SigHashCache::new(&spend_tx).signature_hash(0, &witness_script, output.value, SigHashType::All)[..]).unwrap();
-										let local_delayedsig = secp_ctx.sign(&sighash, &delayed_payment_key);
-										spend_tx.input[0].witness.push(local_delayedsig.serialize_der().to_vec());
-										spend_tx.input[0].witness[0].push(SigHashType::All as u8);
-										spend_tx.input[0].witness.push(vec!()); //MINIMALIF
-										spend_tx.input[0].witness.push(witness_script.clone().into_bytes());
-									} else { panic!() }
-									txn.push(spend_tx);
-								},
-								SpendableOutputDescriptor::StaticOutput { ref outpoint, ref output } => {
-									let secp_ctx = Secp256k1::new();
-									let input = TxIn {
-										previous_output: outpoint.into_bitcoin_outpoint(),
-										script_sig: Script::new(),
-										sequence: 0,
-										witness: Vec::new(),
-									};
-									let outp = TxOut {
-										script_pubkey: Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script(),
-										value: output.value,
-									};
-									let mut spend_tx = Transaction {
-										version: 2,
-										lock_time: 0,
-										input: vec![input],
-										output: vec![outp.clone()],
-									};
-									spend_tx.output[0].value -= (spend_tx.get_weight() + 2 + 1 + 73 + 35 + 3) as u64 / 4; // (Max weight + 3 (to round up)) / 4
-									let secret = {
-										match ExtendedPrivKey::new_master(Network::Testnet, &$node.node_seed) {
-											Ok(master_key) => {
-												match master_key.ckd_priv(&secp_ctx, ChildNumber::from_hardened_idx($der_idx).expect("key space exhausted")) {
-													Ok(key) => key,
-													Err(_) => panic!("Your RNG is busted"),
-												}
-											}
-											Err(_) => panic!("Your rng is busted"),
-										}
-									};
-									let pubkey = ExtendedPubKey::from_private(&secp_ctx, &secret).public_key;
-									let witness_script = Address::p2pkh(&pubkey, Network::Testnet).script_pubkey();
-									let sighash = Message::from_slice(&bip143::SigHashCache::new(&spend_tx).signature_hash(0, &witness_script, output.value, SigHashType::All)[..]).unwrap();
-									let sig = secp_ctx.sign(&sighash, &secret.private_key.key);
-									spend_tx.input[0].witness.push(sig.serialize_der().to_vec());
-									spend_tx.input[0].witness[0].push(SigHashType::All as u8);
-									spend_tx.input[0].witness.push(pubkey.key.serialize().to_vec());
-									txn.push(spend_tx);
-								},
-							}
+					Event::SpendableOutputs { mut outputs } => {
+						for outp in outputs.drain(..) {
+							txn.push($keysinterface.backing.spend_spendable_outputs(&[&outp], Vec::new(), Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script(), 253, &secp_ctx).unwrap());
+							all_outputs.push(outp);
 						}
 					},
 					_ => panic!("Unexpected event"),
 				};
+			}
+			if all_outputs.len() > 1 {
+				if let Ok(tx) = $keysinterface.backing.spend_spendable_outputs(&all_outputs.iter().map(|a| a).collect::<Vec<_>>(), Vec::new(), Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script(), 253, &secp_ctx) {
+					txn.push(tx);
+				}
 			}
 			txn
 		}
@@ -4783,7 +4657,7 @@ fn test_claim_sizeable_push_msat() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 99000000, InitFeatures::known(), InitFeatures::known());
-	nodes[1].node.force_close_channel(&chan.2);
+	nodes[1].node.force_close_channel(&chan.2).unwrap();
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
@@ -4791,9 +4665,8 @@ fn test_claim_sizeable_push_msat() {
 	check_spends!(node_txn[0], chan.3);
 	assert_eq!(node_txn[0].output.len(), 2); // We can't force trimming of to_remote output as channel_reserve_satoshis block us to do so at channel opening
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone()] }, 0);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
@@ -4810,7 +4683,7 @@ fn test_claim_on_remote_sizeable_push_msat() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 99000000, InitFeatures::known(), InitFeatures::known());
-	nodes[0].node.force_close_channel(&chan.2);
+	nodes[0].node.force_close_channel(&chan.2).unwrap();
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
@@ -4819,11 +4692,10 @@ fn test_claim_on_remote_sizeable_push_msat() {
 	check_spends!(node_txn[0], chan.3);
 	assert_eq!(node_txn[0].output.len(), 2); // We can't force trimming of to_remote output as channel_reserve_satoshis block us to do so at channel opening
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone()] }, 0);
+	mine_transaction(&nodes[1], &node_txn[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
@@ -4847,20 +4719,19 @@ fn test_claim_on_remote_revoked_sizeable_push_msat() {
 	assert_eq!(revoked_local_txn[0].input[0].previous_output.txid, chan.3.txid());
 
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 0);
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
 	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_1, txdata: vec![node_txn[0].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2);
+	assert_eq!(spend_txn.len(), 3);
 	check_spends!(spend_txn[0], revoked_local_txn[0]); // to_remote output on revoked remote commitment_tx
 	check_spends!(spend_txn[1], node_txn[0]);
+	check_spends!(spend_txn[2], revoked_local_txn[0], node_txn[0]); // Both outputs
 }
 
 #[test]
@@ -4880,10 +4751,9 @@ fn test_static_spendable_outputs_preimage_tx() {
 	assert_eq!(commitment_tx[0].input[0].previous_output.txid, chan_1.3.txid());
 
 	// Settle A's commitment tx on B's chain
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	assert!(nodes[1].node.claim_funds(payment_preimage, &None, 3_000_000));
 	check_added_monitors!(nodes[1], 1);
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_tx[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &commitment_tx[0]);
 	check_added_monitors!(nodes[1], 1);
 	let events = nodes[1].node.get_and_clear_pending_msg_events();
 	match events[0] {
@@ -4903,9 +4773,8 @@ fn test_static_spendable_outputs_preimage_tx() {
 	check_spends!(node_txn[1], chan_1.3);
 	check_spends!(node_txn[2], node_txn[1]);
 
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_1, txdata: vec![node_txn[0].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
@@ -4932,8 +4801,7 @@ fn test_static_spendable_outputs_timeout_tx() {
 	assert_eq!(commitment_tx[0].input[0].previous_output.txid, chan_1.3.txid());
 
 	// Settle A's commitment tx on B' chain
-	let header = BlockHeader { version: 0x2000_0000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_tx[0].clone()] }, 0);
+	mine_transaction(&nodes[1], &commitment_tx[0]);
 	check_added_monitors!(nodes[1], 1);
 	let events = nodes[1].node.get_and_clear_pending_msg_events();
 	match events[0] {
@@ -4949,14 +4817,15 @@ fn test_static_spendable_outputs_timeout_tx() {
 	check_spends!(node_txn[1], chan_1.3.clone());
 	check_spends!(node_txn[2], node_txn[1]);
 
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_1, txdata: vec![node_txn[0].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 	expect_payment_failed!(nodes[1], our_payment_hash, true);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2); // SpendableOutput: remote_commitment_tx.to_remote, timeout_tx.output
+	assert_eq!(spend_txn.len(), 3); // SpendableOutput: remote_commitment_tx.to_remote, timeout_tx.output
+	check_spends!(spend_txn[0], commitment_tx[0]);
 	check_spends!(spend_txn[1], node_txn[0]);
+	check_spends!(spend_txn[2], node_txn[0], commitment_tx[0]); // All outputs
 }
 
 #[test]
@@ -4976,8 +4845,7 @@ fn test_static_spendable_outputs_justice_tx_revoked_commitment_tx() {
 
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
 
-	let  header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 0);
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
@@ -4986,9 +4854,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_commitment_tx() {
 	assert_eq!(node_txn[0].input.len(), 2);
 	check_spends!(node_txn[0], revoked_local_txn[0]);
 
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_1, txdata: vec![node_txn[0].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[0]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
@@ -4997,7 +4864,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_commitment_tx() {
 
 #[test]
 fn test_static_spendable_outputs_justice_tx_revoked_htlc_timeout_tx() {
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -5012,9 +4880,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_timeout_tx() {
 
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	// A will generate HTLC-Timeout from revoked commitment tx
-	connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[0], &revoked_local_txn[0]);
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
@@ -5026,7 +4893,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_timeout_tx() {
 	check_spends!(revoked_htlc_txn[1], chan_1.3);
 
 	// B will generate justice tx from A's revoked commitment/HTLC tx
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone(), revoked_htlc_txn[0].clone()] }, 0);
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone(), revoked_htlc_txn[0].clone()] });
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
@@ -5050,9 +4918,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_timeout_tx() {
 	assert_eq!(node_txn[2].input.len(), 1);
 	check_spends!(node_txn[2], chan_1.3);
 
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_1, txdata: vec![node_txn[1].clone()] }, 1);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[1], &node_txn[1]);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	// Check B's ChannelMonitor was able to generate the right spendable output descriptor
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
@@ -5063,7 +4930,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_timeout_tx() {
 
 #[test]
 fn test_static_spendable_outputs_justice_tx_revoked_htlc_success_tx() {
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[1].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -5081,9 +4949,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_success_tx() {
 
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	// B will generate HTLC-Success from revoked commitment tx
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &revoked_local_txn[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 	let revoked_htlc_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
@@ -5098,7 +4965,8 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_success_tx() {
 	assert_eq!(revoked_local_txn[0].output[unspent_local_txn_output].script_pubkey.len(), 2 + 20); // P2WPKH
 
 	// A will generate justice tx from B's revoked commitment/HTLC tx
-	connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone(), revoked_htlc_txn[0].clone()] }, 1);
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header, txdata: vec![revoked_local_txn[0].clone(), revoked_htlc_txn[0].clone()] });
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
@@ -5122,20 +4990,20 @@ fn test_static_spendable_outputs_justice_tx_revoked_htlc_success_tx() {
 
 	check_spends!(node_txn[2], chan_1.3);
 
-	let header_1 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_1, txdata: vec![node_txn[1].clone()] }, 1);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 1, true, header.block_hash());
+	mine_transaction(&nodes[0], &node_txn[1]);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 
 	// Note that nodes[0]'s tx_broadcaster is still locked, so if we get here the channelmonitor
 	// didn't try to generate any new transactions.
 
 	// Check A's ChannelMonitor was able to generate the right spendable output descriptor
 	let spend_txn = check_spendable_outputs!(nodes[0], 1, node_cfgs[0].keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2);
+	assert_eq!(spend_txn.len(), 3);
 	assert_eq!(spend_txn[0].input.len(), 1);
 	check_spends!(spend_txn[0], revoked_local_txn[0]); // spending to_remote output from revoked local tx
 	assert_ne!(spend_txn[0].input[0].previous_output, revoked_htlc_txn[0].input[0].previous_output);
 	check_spends!(spend_txn[1], node_txn[1]); // spending justice tx output on the htlc success tx
+	check_spends!(spend_txn[2], revoked_local_txn[0], node_txn[1]); // Both outputs
 }
 
 #[test]
@@ -5162,7 +5030,6 @@ fn test_onchain_to_onchain_claim() {
 	send_payment(&nodes[0], &vec!(&nodes[1], &nodes[2])[..], 8000000, 8_000_000);
 
 	let (payment_preimage, _payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1], &nodes[2]), 3000000);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
 	let commitment_tx = get_local_commitment_txn!(nodes[2], chan_2.2);
 	check_spends!(commitment_tx[0], chan_2.3);
 	nodes[2].node.claim_funds(payment_preimage, &None, 3_000_000);
@@ -5173,7 +5040,7 @@ fn test_onchain_to_onchain_claim() {
 	assert_eq!(updates.update_fulfill_htlcs.len(), 1);
 	assert!(updates.update_fail_malformed_htlcs.is_empty());
 
-	connect_block(&nodes[2], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 1);
+	mine_transaction(&nodes[2], &commitment_tx[0]);
 	check_closed_broadcast!(nodes[2], false);
 	check_added_monitors!(nodes[2], 1);
 
@@ -5189,7 +5056,8 @@ fn test_onchain_to_onchain_claim() {
 	assert_eq!(c_txn[0].lock_time, 0); // Success tx
 
 	// So we broadcast C's commitment tx and HTLC-Success on B's chain, we should successfully be able to extract preimage and update downstream monitor
-	connect_block(&nodes[1], &Block { header, txdata: vec![c_txn[1].clone(), c_txn[2].clone()]}, 1);
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
+	connect_block(&nodes[1], &Block { header, txdata: vec![c_txn[1].clone(), c_txn[2].clone()]});
 	{
 		let mut b_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		// ChannelMonitor: claim tx, ChannelManager: local commitment tx + HTLC-timeout tx
@@ -5224,7 +5092,7 @@ fn test_onchain_to_onchain_claim() {
 	};
 	// Broadcast A's commitment tx on B's chain to see if we are able to claim inbound HTLC with our HTLC-Success tx
 	let commitment_tx = get_local_commitment_txn!(nodes[0], chan_1.2);
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_tx[0].clone()]}, 1);
+	mine_transaction(&nodes[1], &commitment_tx[0]);
 	let b_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 	// ChannelMonitor: HTLC-Success tx, ChannelManager: local commitment tx + HTLC-Success tx
 	assert_eq!(b_txn.len(), 3);
@@ -5259,8 +5127,7 @@ fn test_duplicate_payment_hash_one_failure_one_success() {
 	assert_eq!(commitment_txn[0].input.len(), 1);
 	check_spends!(commitment_txn[0], chan_2.3);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![commitment_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &commitment_txn[0]);
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
@@ -5283,7 +5150,7 @@ fn test_duplicate_payment_hash_one_failure_one_success() {
 	}
 
 	nodes[2].node.claim_funds(our_payment_preimage, &None, 900_000);
-	connect_block(&nodes[2], &Block { header, txdata: vec![commitment_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[2], &commitment_txn[0]);
 	check_added_monitors!(nodes[2], 3);
 	let events = nodes[2].node.get_and_clear_pending_msg_events();
 	match events[0] {
@@ -5309,8 +5176,8 @@ fn test_duplicate_payment_hash_one_failure_one_success() {
 	check_spends!(htlc_success_txn[0], commitment_txn[0]);
 	check_spends!(htlc_success_txn[1], commitment_txn[0]);
 
-	connect_block(&nodes[1], &Block { header, txdata: vec![htlc_timeout_tx] }, 200);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 200, true, header.block_hash());
+	mine_transaction(&nodes[1], &htlc_timeout_tx);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 	expect_pending_htlcs_forwardable!(nodes[1]);
 	let htlc_updates = get_htlc_update_msgs!(nodes[1], nodes[0].node.get_our_node_id());
 	assert!(htlc_updates.update_add_htlcs.is_empty());
@@ -5335,7 +5202,7 @@ fn test_duplicate_payment_hash_one_failure_one_success() {
 	expect_payment_failed!(nodes[0], duplicate_payment_hash, false);
 
 	// Solve 2nd HTLC by broadcasting on B's chain HTLC-Success Tx from C
-	connect_block(&nodes[1], &Block { header, txdata: vec![htlc_success_txn[0].clone()] }, 200);
+	mine_transaction(&nodes[1], &htlc_success_txn[0]);
 	let updates = get_htlc_update_msgs!(nodes[1], nodes[0].node.get_our_node_id());
 	assert!(updates.update_add_htlcs.is_empty());
 	assert!(updates.update_fail_htlcs.is_empty());
@@ -5368,14 +5235,14 @@ fn test_dynamic_spendable_outputs_local_htlc_success_tx() {
 
 	let payment_preimage = route_payment(&nodes[0], &vec!(&nodes[1])[..], 9000000).0;
 	let local_txn = get_local_commitment_txn!(nodes[1], chan_1.2);
+	assert_eq!(local_txn.len(), 1);
 	assert_eq!(local_txn[0].input.len(), 1);
 	check_spends!(local_txn[0], chan_1.3);
 
 	// Give B knowledge of preimage to be able to generate a local HTLC-Success Tx
 	nodes[1].node.claim_funds(payment_preimage, &None, 9_000_000);
 	check_added_monitors!(nodes[1], 1);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![local_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &local_txn[0]);
 	check_added_monitors!(nodes[1], 1);
 	let events = nodes[1].node.get_and_clear_pending_msg_events();
 	match events[0] {
@@ -5386,23 +5253,24 @@ fn test_dynamic_spendable_outputs_local_htlc_success_tx() {
 		MessageSendEvent::BroadcastChannelUpdate { .. } => {},
 		_ => panic!("Unexepected event"),
 	}
-	let node_txn = {
+	let node_tx = {
 		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		assert_eq!(node_txn.len(), 3);
+		assert_eq!(node_txn[0], node_txn[2]);
+		assert_eq!(node_txn[1], local_txn[0]);
 		assert_eq!(node_txn[0].input.len(), 1);
 		assert_eq!(node_txn[0].input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
 		check_spends!(node_txn[0], local_txn[0]);
-		vec![node_txn[0].clone(), node_txn[2].clone()]
+		node_txn[0].clone()
 	};
 
-	let header_201 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header: header_201, txdata: node_txn.clone() }, 201);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 201, true, header_201.block_hash());
+	mine_transaction(&nodes[1], &node_tx);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	// Verify that B is able to spend its own HTLC-Success tx thanks to spendable output event given back by its ChannelMonitor
 	let spend_txn = check_spendable_outputs!(nodes[1], 1, node_cfgs[1].keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2);
-	check_spends!(spend_txn[0], node_txn[0]);
-	check_spends!(spend_txn[1], node_txn[1]);
+	assert_eq!(spend_txn.len(), 1);
+	check_spends!(spend_txn[0], node_tx);
 }
 
 fn do_test_fail_backwards_unrevoked_remote_announce(deliver_last_raa: bool, announce_latest: bool) {
@@ -5442,7 +5310,7 @@ fn do_test_fail_backwards_unrevoked_remote_announce(deliver_last_raa: bool, anno
 	let (_, payment_hash_2) = route_payment(&nodes[0], &[&nodes[2], &nodes[3], &nodes[4]], ds_dust_limit*1000); // not added < dust limit + HTLC tx fee
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
 	let our_node_id = &nodes[1].node.get_our_node_id();
-	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, &Vec::new(), ds_dust_limit*1000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, None, &Vec::new(), ds_dust_limit*1000, TEST_FINAL_CLTV, &logger).unwrap();
 	// 2nd HTLC:
 	send_along_route_with_hash(&nodes[1], route.clone(), &[&nodes[2], &nodes[3], &nodes[5]], ds_dust_limit*1000, payment_hash_1); // not added < dust limit + HTLC tx fee
 	// 3rd HTLC:
@@ -5451,7 +5319,7 @@ fn do_test_fail_backwards_unrevoked_remote_announce(deliver_last_raa: bool, anno
 	let (_, payment_hash_3) = route_payment(&nodes[0], &[&nodes[2], &nodes[3], &nodes[4]], 1000000);
 	// 5th HTLC:
 	let (_, payment_hash_4) = route_payment(&nodes[0], &[&nodes[2], &nodes[3], &nodes[4]], 1000000);
-	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	// 6th HTLC:
 	send_along_route_with_hash(&nodes[1], route.clone(), &[&nodes[2], &nodes[3], &nodes[5]], 1000000, payment_hash_3);
 	// 7th HTLC:
@@ -5460,13 +5328,13 @@ fn do_test_fail_backwards_unrevoked_remote_announce(deliver_last_raa: bool, anno
 	// 8th HTLC:
 	let (_, payment_hash_5) = route_payment(&nodes[0], &[&nodes[2], &nodes[3], &nodes[4]], 1000000);
 	// 9th HTLC:
-	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, &Vec::new(), ds_dust_limit*1000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, None, &Vec::new(), ds_dust_limit*1000, TEST_FINAL_CLTV, &logger).unwrap();
 	send_along_route_with_hash(&nodes[1], route, &[&nodes[2], &nodes[3], &nodes[5]], ds_dust_limit*1000, payment_hash_5); // not added < dust limit + HTLC tx fee
 
 	// 10th HTLC:
 	let (_, payment_hash_6) = route_payment(&nodes[0], &[&nodes[2], &nodes[3], &nodes[4]], ds_dust_limit*1000); // not added < dust limit + HTLC tx fee
 	// 11th HTLC:
-	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(our_node_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[5].node.get_our_node_id(), None, None, &Vec::new(), 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	send_along_route_with_hash(&nodes[1], route, &[&nodes[2], &nodes[3], &nodes[5]], 1000000, payment_hash_6);
 
 	// Double-check that six of the new HTLC were added
@@ -5534,13 +5402,12 @@ fn do_test_fail_backwards_unrevoked_remote_announce(deliver_last_raa: bool, anno
 	// result in failures for the below-dust HTLCs, ie the 0th, 1st, 2nd, 3rd, 9th, and 10th HTLCs.
 	let ds_last_commitment_tx = get_local_commitment_txn!(nodes[3], chan.2);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	if announce_latest {
-		connect_block(&nodes[2], &Block { header, txdata: vec![ds_last_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[2], &ds_last_commitment_tx[0]);
 	} else {
-		connect_block(&nodes[2], &Block { header, txdata: vec![ds_prev_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[2], &ds_prev_commitment_tx[0]);
 	}
-	connect_blocks(&nodes[2], ANTI_REORG_DELAY - 1, 1, true,  header.block_hash());
+	connect_blocks(&nodes[2], ANTI_REORG_DELAY - 1);
 	check_closed_broadcast!(nodes[2], false);
 	expect_pending_htlcs_forwardable!(nodes[2]);
 	check_added_monitors!(nodes[2], 3);
@@ -5677,8 +5544,7 @@ fn test_dynamic_spendable_outputs_local_htlc_timeout_tx() {
 	check_spends!(local_txn[0], chan_1.3);
 
 	// Timeout HTLC on A's chain and so it can generate a HTLC-Timeout tx
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![local_txn[0].clone()] }, 200);
+	mine_transaction(&nodes[0], &local_txn[0]);
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
@@ -5690,16 +5556,16 @@ fn test_dynamic_spendable_outputs_local_htlc_timeout_tx() {
 		node_txn[0].clone()
 	};
 
-	let header_201 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_201, txdata: vec![htlc_timeout.clone()] }, 201);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 201, true, header_201.block_hash());
+	mine_transaction(&nodes[0], &htlc_timeout);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 	expect_payment_failed!(nodes[0], our_payment_hash, true);
 
 	// Verify that A is able to spend its own HTLC-Timeout tx thanks to spendable output event given back by its ChannelMonitor
 	let spend_txn = check_spendable_outputs!(nodes[0], 1, node_cfgs[0].keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2);
+	assert_eq!(spend_txn.len(), 3);
 	check_spends!(spend_txn[0], local_txn[0]);
 	check_spends!(spend_txn[1], htlc_timeout);
+	check_spends!(spend_txn[2], local_txn[0], htlc_timeout);
 }
 
 #[test]
@@ -5713,8 +5579,8 @@ fn test_key_derivation_params() {
 	// We manually create the node configuration to backup the seed.
 	let seed = [42; 32];
 	let keys_manager = test_utils::TestKeysInterface::new(&seed, Network::Testnet);
-	let chain_monitor = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[0].chain_source), &chanmon_cfgs[0].tx_broadcaster, &chanmon_cfgs[0].logger, &chanmon_cfgs[0].fee_estimator, &chanmon_cfgs[0].persister);
-	let node = NodeCfg { chain_source: &chanmon_cfgs[0].chain_source, logger: &chanmon_cfgs[0].logger, tx_broadcaster: &chanmon_cfgs[0].tx_broadcaster, fee_estimator: &chanmon_cfgs[0].fee_estimator, chain_monitor, keys_manager, node_seed: seed };
+	let chain_monitor = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[0].chain_source), &chanmon_cfgs[0].tx_broadcaster, &chanmon_cfgs[0].logger, &chanmon_cfgs[0].fee_estimator, &chanmon_cfgs[0].persister, &keys_manager);
+	let node = NodeCfg { chain_source: &chanmon_cfgs[0].chain_source, logger: &chanmon_cfgs[0].logger, tx_broadcaster: &chanmon_cfgs[0].tx_broadcaster, fee_estimator: &chanmon_cfgs[0].fee_estimator, chain_monitor, keys_manager: &keys_manager, node_seed: seed };
 	let mut node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	node_cfgs.remove(0);
 	node_cfgs.insert(0, node);
@@ -5746,8 +5612,7 @@ fn test_key_derivation_params() {
 	}
 
 	// Timeout HTLC on A's chain and so it can generate a HTLC-Timeout tx
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![local_txn_1[0].clone()] }, 200);
+	mine_transaction(&nodes[0], &local_txn_1[0]);
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
@@ -5759,17 +5624,17 @@ fn test_key_derivation_params() {
 		node_txn[0].clone()
 	};
 
-	let header_201 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_201, txdata: vec![htlc_timeout.clone()] }, 201);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 201, true, header_201.block_hash());
+	mine_transaction(&nodes[0], &htlc_timeout);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 	expect_payment_failed!(nodes[0], our_payment_hash, true);
 
 	// Verify that A is able to spend its own HTLC-Timeout tx thanks to spendable output event given back by its ChannelMonitor
 	let new_keys_manager = test_utils::TestKeysInterface::new(&seed, Network::Testnet);
 	let spend_txn = check_spendable_outputs!(nodes[0], 1, new_keys_manager, 100000);
-	assert_eq!(spend_txn.len(), 2);
+	assert_eq!(spend_txn.len(), 3);
 	check_spends!(spend_txn[0], local_txn_1[0]);
 	check_spends!(spend_txn[1], htlc_timeout);
+	check_spends!(spend_txn[2], local_txn_1[0], htlc_timeout);
 }
 
 #[test]
@@ -5784,16 +5649,15 @@ fn test_static_output_closing_tx() {
 	send_payment(&nodes[0], &vec!(&nodes[1])[..], 8000000, 8_000_000);
 	let closing_tx = close_channel(&nodes[0], &nodes[1], &chan.2, chan.3, true).2;
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![closing_tx.clone()] }, 0);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 0, true, header.block_hash());
+	mine_transaction(&nodes[0], &closing_tx);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[0], 2, node_cfgs[0].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
 	check_spends!(spend_txn[0], closing_tx);
 
-	connect_block(&nodes[1], &Block { header, txdata: vec![closing_tx.clone()] }, 0);
-	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1, 0, true, header.block_hash());
+	mine_transaction(&nodes[1], &closing_tx);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
 
 	let spend_txn = check_spendable_outputs!(nodes[1], 2, node_cfgs[1].keys_manager, 100000);
 	assert_eq!(spend_txn.len(), 1);
@@ -5831,12 +5695,13 @@ fn do_htlc_claim_local_commitment_only(use_dust: bool) {
 	nodes[1].node.handle_revoke_and_ack(&nodes[0].node.get_our_node_id(), &as_updates.0);
 	check_added_monitors!(nodes[1], 1);
 
+	let starting_block = nodes[1].best_block_info();
 	let mut block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+		header: BlockHeader { version: 0x20000000, prev_blockhash: starting_block.0, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 		txdata: vec![],
 	};
-	for i in 1..TEST_FINAL_CLTV - CLTV_CLAIM_BUFFER + CHAN_CONFIRM_DEPTH + 1 {
-		connect_block(&nodes[1], &block, i);
+	for _ in starting_block.1 + 1..TEST_FINAL_CLTV - CLTV_CLAIM_BUFFER + starting_block.1 + 2 {
+		connect_block(&nodes[1], &block);
 		block.header.prev_blockhash = block.block_hash();
 	}
 	test_txn_broadcast(&nodes[1], &chan, None, if use_dust { HTLCType::NONE } else { HTLCType::SUCCESS });
@@ -5854,7 +5719,7 @@ fn do_htlc_claim_current_remote_commitment_only(use_dust: bool) {
 
 	let (_, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &Vec::new(), if use_dust { 50000 } else { 3000000 }, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &Vec::new(), if use_dust { 50000 } else { 3000000 }, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
@@ -5864,10 +5729,11 @@ fn do_htlc_claim_current_remote_commitment_only(use_dust: bool) {
 	// transaction, however it is not in A's latest local commitment, so we can just broadcast that
 	// to "time out" the HTLC.
 
-	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	let starting_block = nodes[1].best_block_info();
+	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: starting_block.0, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 
-	for i in 1..TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + CHAN_CONFIRM_DEPTH + 1 {
-		connect_block(&nodes[0], &Block { header, txdata: Vec::new()}, i);
+	for _ in starting_block.1 + 1..TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + starting_block.1 + 2 {
+		connect_block(&nodes[0], &Block { header, txdata: Vec::new()});
 		header.prev_blockhash = header.block_hash();
 	}
 	test_txn_broadcast(&nodes[0], &chan, None, HTLCType::NONE);
@@ -5908,12 +5774,13 @@ fn do_htlc_claim_previous_remote_commitment_only(use_dust: bool, check_revoke_no
 		check_added_monitors!(nodes[0], 1);
 	}
 
+	let starting_block = nodes[1].best_block_info();
 	let mut block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+		header: BlockHeader { version: 0x20000000, prev_blockhash: starting_block.0, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 		txdata: vec![],
 	};
-	for i in 1..TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + CHAN_CONFIRM_DEPTH + 1 {
-		connect_block(&nodes[0], &block, i);
+	for _ in starting_block.1 + 1..TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + CHAN_CONFIRM_DEPTH + 2 {
+		connect_block(&nodes[0], &block);
 		block.header.prev_blockhash = block.block_hash();
 	}
 	if !check_revoke_no_close {
@@ -6058,7 +5925,7 @@ fn test_fail_holding_cell_htlc_upon_free() {
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let max_can_send = 5000000 - channel_reserve - 2*commit_tx_fee_msat(feerate, 1 + 1);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
 
 	// Send a payment which passes reserve checks but gets stuck in the holding cell.
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
@@ -6133,8 +6000,8 @@ fn test_free_and_fail_holding_cell_htlcs() {
 	let (_, payment_hash_2) = get_payment_preimage_hash!(nodes[0]);
 	let amt_2 = 5000000 - channel_reserve - 2*commit_tx_fee_msat(feerate, 2 + 1) - amt_1;
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route_1 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], amt_1, TEST_FINAL_CLTV, &logger).unwrap();
-	let route_2 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], amt_2, TEST_FINAL_CLTV, &logger).unwrap();
+	let route_1 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], amt_1, TEST_FINAL_CLTV, &logger).unwrap();
+	let route_2 = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], amt_2, TEST_FINAL_CLTV, &logger).unwrap();
 
 	// Send 2 payments which pass reserve checks but get stuck in the holding cell.
 	nodes[0].node.send_payment(&route_1, payment_hash_1, &None).unwrap();
@@ -6257,7 +6124,7 @@ fn test_fail_holding_cell_htlc_upon_free_multihop() {
 	let max_can_send = 5000000 - channel_reserve - 2*commit_tx_fee_msat(feerate, 1 + 1) - total_routing_fee_msat;
 	let payment_event = {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 
@@ -6373,7 +6240,7 @@ fn test_update_add_htlc_bolt2_sender_value_below_minimum_msat() {
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	route.paths[0][0].fee_msat = 100;
 
 	unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
@@ -6394,7 +6261,7 @@ fn test_update_add_htlc_bolt2_sender_zero_value_msat() {
 
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	route.paths[0][0].fee_msat = 0;
 	unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
 		assert_eq!(err, "Cannot send 0-msat HTLC"));
@@ -6415,7 +6282,7 @@ fn test_update_add_htlc_bolt2_receiver_zero_value_msat() {
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let mut updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6435,13 +6302,13 @@ fn test_update_add_htlc_bolt2_sender_cltv_expiry_too_high() {
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-	let _chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 0, InitFeatures::known(), InitFeatures::known());
+	let _chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 0, InitFeatures::known(), InitFeatures::known());
 	let logger = test_utils::TestLogger::new();
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000000, 500000001, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000000, 500000001, &logger).unwrap();
 	unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::RouteError { ref err },
 		assert_eq!(err, &"Channel CLTV overflowed?"));
 }
@@ -6463,7 +6330,7 @@ fn test_update_add_htlc_bolt2_sender_exceed_max_htlc_num_and_htlc_id_increment()
 		let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 		let payment_event = {
 			let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+			let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 			nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 			check_added_monitors!(nodes[0], 1);
 
@@ -6485,7 +6352,7 @@ fn test_update_add_htlc_bolt2_sender_exceed_max_htlc_num_and_htlc_id_increment()
 	}
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
 		assert!(regex::Regex::new(r"Cannot push more than their max accepted HTLCs \(\d+\)").unwrap().is_match(err)));
 
@@ -6507,9 +6374,13 @@ fn test_update_add_htlc_bolt2_sender_exceed_max_htlc_value_in_flight() {
 	send_payment(&nodes[0], &vec!(&nodes[1])[..], max_in_flight, max_in_flight);
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
-	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let logger = test_utils::TestLogger::new();
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], max_in_flight+1, TEST_FINAL_CLTV, &logger).unwrap();
+	// Manually create a route over our max in flight (which our router normally automatically
+	// limits us to.
+	let route = Route { paths: vec![vec![RouteHop {
+	   pubkey: nodes[1].node.get_our_node_id(), node_features: NodeFeatures::known(), channel_features: ChannelFeatures::known(),
+	   short_channel_id: nodes[1].node.list_usable_channels()[0].short_channel_id.unwrap(),
+	   fee_msat: max_in_flight + 1, cltv_expiry_delta: TEST_FINAL_CLTV
+	}]] };
 	unwrap_send_err!(nodes[0].node.send_payment(&route, our_payment_hash, &None), true, APIError::ChannelUnavailable { ref err },
 		assert!(regex::Regex::new(r"Cannot send value that would put us over the max HTLC value in flight our peer will accept \(\d+\)").unwrap().is_match(err)));
 
@@ -6538,7 +6409,7 @@ fn test_update_add_htlc_bolt2_receiver_check_amount_received_more_than_min() {
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], htlc_minimum_msat, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], htlc_minimum_msat, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let mut updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6569,7 +6440,7 @@ fn test_update_add_htlc_bolt2_receiver_sender_can_afford_amount_sent() {
 	let max_can_send = 5000000 - channel_reserve - commit_tx_fee_outbound;
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], max_can_send, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let mut updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6601,7 +6472,7 @@ fn test_update_add_htlc_bolt2_receiver_check_max_htlc_limit() {
 	let session_priv = SecretKey::from_slice(&[42; 32]).unwrap();
 
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 3999999, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 3999999, TEST_FINAL_CLTV, &logger).unwrap();
 
 	let cur_height = nodes[0].node.latest_block_height.load(Ordering::Acquire) as u32 + 1;
 	let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::signing_only(), &route.paths[0], &session_priv).unwrap();
@@ -6642,7 +6513,7 @@ fn test_update_add_htlc_bolt2_receiver_check_max_in_flight_msat() {
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let mut updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6667,7 +6538,7 @@ fn test_update_add_htlc_bolt2_receiver_check_cltv_expiry() {
 	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 95000000, InitFeatures::known(), InitFeatures::known());
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let mut updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6694,7 +6565,7 @@ fn test_update_add_htlc_bolt2_receiver_check_repeated_id_ignore() {
 	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6741,7 +6612,7 @@ fn test_update_fulfill_htlc_bolt2_update_fulfill_htlc_before_commitment() {
 	let chan = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
 	let (our_payment_preimage, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 
 	check_added_monitors!(nodes[0], 1);
@@ -6775,7 +6646,7 @@ fn test_update_fulfill_htlc_bolt2_update_fail_htlc_before_commitment() {
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -6808,12 +6679,11 @@ fn test_update_fulfill_htlc_bolt2_update_fail_malformed_htlc_before_commitment()
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &updates.update_add_htlcs[0]);
-
 	let update_msg = msgs::UpdateFailMalformedHTLC{
 		channel_id: chan.2,
 		htlc_id: 0,
@@ -6924,7 +6794,7 @@ fn test_update_fulfill_htlc_bolt2_missing_badonion_bit_for_malformed_htlc_messag
 
 	let (_, our_payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[1].node.get_our_node_id(), None, None, &[], 1000000, TEST_FINAL_CLTV, &logger).unwrap();
 	nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
@@ -6977,7 +6847,7 @@ fn test_update_fulfill_htlc_bolt2_after_malformed_htlc_message_must_forward_upda
 	//First hop
 	let mut payment_event = {
 		let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &Vec::new(), 100000, TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[0].node.send_payment(&route, our_payment_hash, &None).unwrap();
 		check_added_monitors!(nodes[0], 1);
 		let mut events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -7044,7 +6914,8 @@ fn do_test_failure_delay_dust_htlc_local_commitment(announce_latest: bool) {
 	// We can have at most two valid local commitment tx, so both cases must be covered, and both txs must be checked to get them all as
 	// HTLC could have been removed from lastest local commitment tx but still valid until we get remote RAA
 
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -7090,19 +6961,17 @@ fn do_test_failure_delay_dust_htlc_local_commitment(announce_latest: bool) {
 
 	assert_ne!(as_prev_commitment_tx, as_last_commitment_tx);
 	// Fail the 2 dust-HTLCs, move their failure in maturation buffer (htlc_updated_waiting_threshold_conf)
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-
 	if announce_latest {
-		connect_block(&nodes[0], &Block { header, txdata: vec![as_last_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[0], &as_last_commitment_tx[0]);
 	} else {
-		connect_block(&nodes[0], &Block { header, txdata: vec![as_prev_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[0], &as_prev_commitment_tx[0]);
 	}
 
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 
 	assert_eq!(nodes[0].node.get_and_clear_pending_events().len(), 0);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 1, true,  header.block_hash());
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 	let events = nodes[0].node.get_and_clear_pending_events();
 	// Only 2 PaymentFailed events should show up, over-dust HTLC has to be failed by timeout tx
 	assert_eq!(events.len(), 2);
@@ -7156,42 +7025,37 @@ fn do_test_sweep_outbound_htlc_failure_update(revoked: bool, local: bool) {
 		claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage_3, 1_000_000);
 	}
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	let mut timeout_tx = Vec::new();
 	if local {
 		// We fail dust-HTLC 1 by broadcast of local commitment tx
-		connect_block(&nodes[0], &Block { header, txdata: vec![as_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[0], &as_commitment_tx[0]);
 		check_closed_broadcast!(nodes[0], false);
 		check_added_monitors!(nodes[0], 1);
 		assert_eq!(nodes[0].node.get_and_clear_pending_events().len(), 0);
 		timeout_tx.push(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap()[0].clone());
-		let parent_hash  = connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 2, true, header.block_hash());
+		connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 		expect_payment_failed!(nodes[0], dust_hash, true);
 		assert_eq!(timeout_tx[0].input[0].witness.last().unwrap().len(), OFFERED_HTLC_SCRIPT_WEIGHT);
 		// We fail non-dust-HTLC 2 by broadcast of local HTLC-timeout tx on local commitment tx
-		let header_2 = BlockHeader { version: 0x20000000, prev_blockhash: parent_hash, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 		assert_eq!(nodes[0].node.get_and_clear_pending_events().len(), 0);
-		connect_block(&nodes[0], &Block { header: header_2, txdata: vec![timeout_tx[0].clone()]}, 7);
-		let header_3 = BlockHeader { version: 0x20000000, prev_blockhash: header_2.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 8, true, header_3.block_hash());
+		mine_transaction(&nodes[0], &timeout_tx[0]);
+		connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 		expect_payment_failed!(nodes[0], non_dust_hash, true);
 	} else {
 		// We fail dust-HTLC 1 by broadcast of remote commitment tx. If revoked, fail also non-dust HTLC
-		connect_block(&nodes[0], &Block { header, txdata: vec![bs_commitment_tx[0].clone()]}, 1);
+		mine_transaction(&nodes[0], &bs_commitment_tx[0]);
 		check_closed_broadcast!(nodes[0], false);
 		check_added_monitors!(nodes[0], 1);
 		assert_eq!(nodes[0].node.get_and_clear_pending_events().len(), 0);
 		timeout_tx.push(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap()[0].clone());
-		let parent_hash  = connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 2, true, header.block_hash());
-		let header_2 = BlockHeader { version: 0x20000000, prev_blockhash: parent_hash, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+		connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 		if !revoked {
 			expect_payment_failed!(nodes[0], dust_hash, true);
 			assert_eq!(timeout_tx[0].input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
 			// We fail non-dust-HTLC 2 by broadcast of local timeout tx on remote commitment tx
-			connect_block(&nodes[0], &Block { header: header_2, txdata: vec![timeout_tx[0].clone()]}, 7);
+			mine_transaction(&nodes[0], &timeout_tx[0]);
 			assert_eq!(nodes[0].node.get_and_clear_pending_events().len(), 0);
-			let header_3 = BlockHeader { version: 0x20000000, prev_blockhash: header_2.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-			connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 8, true, header_3.block_hash());
+			connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 			expect_payment_failed!(nodes[0], non_dust_hash, true);
 		} else {
 			// If revoked, both dust & non-dust HTLCs should have been failed after ANTI_REORG_DELAY confs of revoked
@@ -7246,7 +7110,7 @@ fn test_upfront_shutdown_script() {
 	let mut node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[2].node.get_our_node_id());
 	node_0_shutdown.scriptpubkey = Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script().to_p2sh();
 	// Test we enforce upfront_scriptpbukey if by providing a diffrent one at closing that  we disconnect peer
-	nodes[2].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+	nodes[2].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
     assert!(regex::Regex::new(r"Got shutdown request with a scriptpubkey \([A-Fa-f0-9]+\) which did not match their previous scriptpubkey.").unwrap().is_match(check_closed_broadcast!(nodes[2], true).unwrap().data.as_str()));
 	check_added_monitors!(nodes[2], 1);
 
@@ -7255,7 +7119,7 @@ fn test_upfront_shutdown_script() {
 	nodes[0].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
 	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[2].node.get_our_node_id());
 	// We test that in case of peer committing upfront to a script, if it oesn't change at closing, we sign
-	nodes[2].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
+	nodes[2].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	let events = nodes[2].node.get_and_clear_pending_msg_events();
 	assert_eq!(events.len(), 1);
 	match events[0] {
@@ -7269,7 +7133,7 @@ fn test_upfront_shutdown_script() {
 	nodes[0].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
 	let mut node_1_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
 	node_1_shutdown.scriptpubkey = Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script().to_p2sh();
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_1_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &InitFeatures::known(), &node_1_shutdown);
 	let events = nodes[1].node.get_and_clear_pending_msg_events();
 	assert_eq!(events.len(), 1);
 	match events[0] {
@@ -7283,7 +7147,7 @@ fn test_upfront_shutdown_script() {
 	nodes[1].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
 	let mut node_0_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
 	node_0_shutdown.scriptpubkey = Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script().to_p2sh();
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_0_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	let events = nodes[0].node.get_and_clear_pending_msg_events();
 	assert_eq!(events.len(), 1);
 	match events[0] {
@@ -7297,7 +7161,7 @@ fn test_upfront_shutdown_script() {
 	nodes[1].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
 	let mut node_0_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
 	node_0_shutdown.scriptpubkey = Builder::new().push_opcode(opcodes::all::OP_RETURN).into_script().to_p2sh();
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_0_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
 	let events = nodes[0].node.get_and_clear_pending_msg_events();
 	assert_eq!(events.len(), 2);
 	match events[0] {
@@ -7308,6 +7172,136 @@ fn test_upfront_shutdown_script() {
 		MessageSendEvent::SendClosingSigned { node_id, .. } => { assert_eq!(node_id, nodes[1].node.get_our_node_id()) }
 		_ => panic!("Unexpected event"),
 	}
+}
+
+#[test]
+fn test_upfront_shutdown_script_unsupport_segwit() {
+	// We test that channel is closed early
+	// if a segwit program is passed as upfront shutdown script,
+	// but the peer does not support segwit.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	nodes[0].node.create_channel(nodes[1].node.get_our_node_id(), 100000, 10001, 42, None).unwrap();
+
+	let mut open_channel = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, nodes[1].node.get_our_node_id());
+	open_channel.shutdown_scriptpubkey = Present(Builder::new().push_int(16)
+		.push_slice(&[0, 0])
+		.into_script());
+
+	let features = InitFeatures::known().clear_shutdown_anysegwit();
+	nodes[0].node.handle_open_channel(&nodes[0].node.get_our_node_id(), features, &open_channel);
+
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	match events[0] {
+		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { ref msg }, node_id } => {
+			assert_eq!(node_id, nodes[0].node.get_our_node_id());
+			assert!(regex::Regex::new(r"Peer is signaling upfront_shutdown but has provided a non-accepted scriptpubkey format. script: (\([A-Fa-f0-9]+\))").unwrap().is_match(&*msg.data));
+		},
+		_ => panic!("Unexpected event"),
+	}
+}
+
+#[test]
+fn test_shutdown_script_any_segwit_allowed() {
+	let mut config = UserConfig::default();
+	config.channel_options.announced_channel = true;
+	config.peer_channel_config_limits.force_announced_channel_preference = false;
+	config.channel_options.commit_upfront_shutdown_pubkey = false;
+	let user_cfgs = [None, Some(config), None];
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &user_cfgs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	//// We test if the remote peer accepts opt_shutdown_anysegwit, a witness program can be used on shutdown
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 1000000, InitFeatures::known(), InitFeatures::known());
+	nodes[1].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
+	let mut node_0_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
+	node_0_shutdown.scriptpubkey = Builder::new().push_int(16)
+		.push_slice(&[0, 0])
+		.into_script();
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	match events[0] {
+		MessageSendEvent::SendShutdown { node_id, .. } => { assert_eq!(node_id, nodes[1].node.get_our_node_id()) }
+		_ => panic!("Unexpected event"),
+	}
+	match events[1] {
+		MessageSendEvent::SendClosingSigned { node_id, .. } => { assert_eq!(node_id, nodes[1].node.get_our_node_id()) }
+		_ => panic!("Unexpected event"),
+	}
+}
+
+#[test]
+fn test_shutdown_script_any_segwit_not_allowed() {
+	let mut config = UserConfig::default();
+	config.channel_options.announced_channel = true;
+	config.peer_channel_config_limits.force_announced_channel_preference = false;
+	config.channel_options.commit_upfront_shutdown_pubkey = false;
+	let user_cfgs = [None, Some(config), None];
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &user_cfgs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	//// We test that if the remote peer does not accept opt_shutdown_anysegwit, the witness program cannot be used on shutdown
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 1000000, InitFeatures::known(), InitFeatures::known());
+	nodes[1].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
+	let mut node_0_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
+	// Make an any segwit version script
+	node_0_shutdown.scriptpubkey = Builder::new().push_int(16)
+		.push_slice(&[0, 0])
+		.into_script();
+	let flags_no = InitFeatures::known().clear_shutdown_anysegwit();
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &flags_no, &node_0_shutdown);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	match events[1] {
+		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { ref msg }, node_id } => {
+			assert_eq!(node_id, nodes[1].node.get_our_node_id());
+			assert_eq!(msg.data, "Got a nonstandard scriptpubkey (60020000) from remote peer".to_owned())
+		},
+		_ => panic!("Unexpected event"),
+	}
+	check_added_monitors!(nodes[0], 1);
+}
+
+#[test]
+fn test_shutdown_script_segwit_but_not_anysegwit() {
+	let mut config = UserConfig::default();
+	config.channel_options.announced_channel = true;
+	config.peer_channel_config_limits.force_announced_channel_preference = false;
+	config.channel_options.commit_upfront_shutdown_pubkey = false;
+	let user_cfgs = [None, Some(config), None];
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &user_cfgs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	//// We test that if shutdown any segwit is supported and we send a witness script with 0 version, this is not accepted
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 1000000, InitFeatures::known(), InitFeatures::known());
+	nodes[1].node.close_channel(&OutPoint { txid: chan.3.txid(), index: 0 }.to_channel_id()).unwrap();
+	let mut node_0_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
+	// Make a segwit script that is not a valid as any segwit
+	node_0_shutdown.scriptpubkey = Builder::new().push_int(0)
+		.push_slice(&[0, 0])
+		.into_script();
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &InitFeatures::known(), &node_0_shutdown);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	match events[1] {
+		MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { ref msg }, node_id } => {
+			assert_eq!(node_id, nodes[1].node.get_our_node_id());
+			assert_eq!(msg.data, "Got a nonstandard scriptpubkey (00020000) from remote peer".to_owned())
+		},
+		_ => panic!("Unexpected event"),
+	}
+	check_added_monitors!(nodes[0], 1);
 }
 
 #[test]
@@ -7325,8 +7319,7 @@ fn test_user_configurable_csv_delay() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	// We test config.our_to_self > BREAKDOWN_TIMEOUT is enforced in Channel::new_outbound()
-	let keys_manager = Arc::new(test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet));
-	if let Err(error) = Channel::new_outbound(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &keys_manager, nodes[1].node.get_our_node_id(), 1000000, 1000000, 0, &low_our_to_self_config) {
+	if let Err(error) = Channel::new_outbound(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &nodes[0].keys_manager, nodes[1].node.get_our_node_id(), 1000000, 1000000, 0, &low_our_to_self_config) {
 		match error {
 			APIError::APIMisuseError { err } => { assert!(regex::Regex::new(r"Configured with an unreasonable our_to_self_delay \(\d+\) putting user funds at risks").unwrap().is_match(err.as_str())); },
 			_ => panic!("Unexpected event"),
@@ -7337,7 +7330,7 @@ fn test_user_configurable_csv_delay() {
 	nodes[1].node.create_channel(nodes[0].node.get_our_node_id(), 1000000, 1000000, 42, None).unwrap();
 	let mut open_channel = get_event_msg!(nodes[1], MessageSendEvent::SendOpenChannel, nodes[0].node.get_our_node_id());
 	open_channel.to_self_delay = 200;
-	if let Err(error) = Channel::new_from_req(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &keys_manager, nodes[1].node.get_our_node_id(), InitFeatures::known(), &open_channel, 0, &low_our_to_self_config) {
+	if let Err(error) = Channel::new_from_req(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &nodes[0].keys_manager, nodes[1].node.get_our_node_id(), InitFeatures::known(), &open_channel, 0, &low_our_to_self_config) {
 		match error {
 			ChannelError::Close(err) => { assert!(regex::Regex::new(r"Configured with an unreasonable our_to_self_delay \(\d+\) putting user funds at risks").unwrap().is_match(err.as_str()));  },
 			_ => panic!("Unexpected event"),
@@ -7363,7 +7356,7 @@ fn test_user_configurable_csv_delay() {
 	nodes[1].node.create_channel(nodes[0].node.get_our_node_id(), 1000000, 1000000, 42, None).unwrap();
 	let mut open_channel = get_event_msg!(nodes[1], MessageSendEvent::SendOpenChannel, nodes[0].node.get_our_node_id());
 	open_channel.to_self_delay = 200;
-	if let Err(error) = Channel::new_from_req(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &keys_manager, nodes[1].node.get_our_node_id(), InitFeatures::known(), &open_channel, 0, &high_their_to_self_config) {
+	if let Err(error) = Channel::new_from_req(&&test_utils::TestFeeEstimator { sat_per_kw: 253 }, &nodes[0].keys_manager, nodes[1].node.get_our_node_id(), InitFeatures::known(), &open_channel, 0, &high_their_to_self_config) {
 		match error {
 			ChannelError::Close(err) => { assert!(regex::Regex::new(r"They wanted our payments to be delayed by a needlessly long period\. Upper limit: \d+\. Actual: \d+").unwrap().is_match(err.as_str())); },
 			_ => panic!("Unexpected event"),
@@ -7375,17 +7368,22 @@ fn test_user_configurable_csv_delay() {
 fn test_data_loss_protect() {
 	// We want to be sure that :
 	// * we don't broadcast our Local Commitment Tx in case of fallen behind
+	//   (but this is not quite true - we broadcast during Drop because chanmon is out of sync with chanmgr)
 	// * we close channel in case of detecting other being fallen behind
 	// * we are able to claim our own outputs thanks to to_remote being static
-	let keys_manager;
+	// TODO: this test is incomplete and the data_loss_protect implementation is incomplete - see issue #775
 	let persister;
 	let logger;
 	let fee_estimator;
 	let tx_broadcaster;
 	let chain_source;
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	// We broadcast during Drop because chanmon is out of sync with chanmgr, which would cause a panic
+	// during signing due to revoked tx
+	chanmon_cfgs[0].keys_manager.disable_revocation_policy_check = true;
+	let keys_manager = &chanmon_cfgs[0].keys_manager;
 	let monitor;
 	let node_state_0;
-	let chanmon_cfgs = create_chanmon_cfgs(2);
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -7395,7 +7393,7 @@ fn test_data_loss_protect() {
 	// Cache node A state before any channel update
 	let previous_node_state = nodes[0].node.encode();
 	let mut previous_chain_monitor_state = test_utils::TestVecWriter(Vec::new());
-	nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap().iter().next().unwrap().1.write(&mut previous_chain_monitor_state).unwrap();
+	nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap().iter().next().unwrap().1.write(&mut previous_chain_monitor_state).unwrap();
 
 	send_payment(&nodes[0], &vec!(&nodes[1])[..], 8000000, 8_000_000);
 	send_payment(&nodes[0], &vec!(&nodes[1])[..], 8000000, 8_000_000);
@@ -7405,18 +7403,17 @@ fn test_data_loss_protect() {
 
 	// Restore node A from previous state
 	logger = test_utils::TestLogger::with_id(format!("node {}", 0));
-	keys_manager = test_utils::TestKeysInterface::new(&nodes[0].node_seed, Network::Testnet);
-	let mut chain_monitor = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut ::std::io::Cursor::new(previous_chain_monitor_state.0), &keys_manager).unwrap().1;
+	let mut chain_monitor = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut ::std::io::Cursor::new(previous_chain_monitor_state.0), keys_manager).unwrap().1;
 	chain_source = test_utils::TestChainSource::new(Network::Testnet);
 	tx_broadcaster = test_utils::TestBroadcaster{txn_broadcasted: Mutex::new(Vec::new())};
 	fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 	persister = test_utils::TestPersister::new();
-	monitor = test_utils::TestChainMonitor::new(Some(&chain_source), &tx_broadcaster, &logger, &fee_estimator, &persister);
+	monitor = test_utils::TestChainMonitor::new(Some(&chain_source), &tx_broadcaster, &logger, &fee_estimator, &persister, keys_manager);
 	node_state_0 = {
 		let mut channel_monitors = HashMap::new();
 		channel_monitors.insert(OutPoint { txid: chan.3.txid(), index: 0 }, &mut chain_monitor);
-		<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut ::std::io::Cursor::new(previous_node_state), ChannelManagerReadArgs {
-			keys_manager: &keys_manager,
+		<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut ::std::io::Cursor::new(previous_node_state), ChannelManagerReadArgs {
+			keys_manager: keys_manager,
 			fee_estimator: &fee_estimator,
 			chain_monitor: &monitor,
 			logger: &logger,
@@ -7475,10 +7472,9 @@ fn test_data_loss_protect() {
 	assert_eq!(node_txn.len(), 1);
 	check_spends!(node_txn[0], chan.3);
 	assert_eq!(node_txn[0].output.len(), 2);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-	connect_block(&nodes[0], &Block { header, txdata: vec![node_txn[0].clone()]}, 0);
-	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 0, true, header.block_hash());
-	let spend_txn = check_spendable_outputs!(nodes[0], 1, node_cfgs[0].keys_manager, 100000);
+	mine_transaction(&nodes[0], &node_txn[0]);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
+	let spend_txn = check_spendable_outputs!(nodes[0], 1, node_cfgs[0].keys_manager, 1000000);
 	assert_eq!(spend_txn.len(), 1);
 	check_spends!(spend_txn[0], node_txn[0]);
 }
@@ -7522,9 +7518,9 @@ fn test_check_htlc_underpaying() {
 	nodes[0].node.handle_update_fail_htlc(&nodes[1].node.get_our_node_id(), &update_fail_htlc);
 	commitment_signed_dance!(nodes[0], nodes[1], commitment_signed, false, true);
 
-	// 10_000 msat as u64, followed by a height of 99 as u32
+	// 10_000 msat as u64, followed by a height of CHAN_CONFIRM_DEPTH as u32
 	let mut expected_failure_data = byte_utils::be64_to_array(10_000).to_vec();
-	expected_failure_data.extend_from_slice(&byte_utils::be32_to_array(99));
+	expected_failure_data.extend_from_slice(&byte_utils::be32_to_array(CHAN_CONFIRM_DEPTH));
 	expect_payment_failed!(nodes[0], payment_hash, true, 0x4000|15, &expected_failure_data[..]);
 	nodes[1].node.get_and_clear_pending_events();
 }
@@ -7604,10 +7600,9 @@ fn test_bump_penalty_txn_on_revoked_commitment() {
 	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 59000000, InitFeatures::known(), InitFeatures::known());
 	let logger = test_utils::TestLogger::new();
 
-
 	let payment_preimage = route_payment(&nodes[0], &vec!(&nodes[1])[..], 3000000).0;
 	let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 3000000, 30, &logger).unwrap();
+	let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 3000000, 30, &logger).unwrap();
 	send_along_route(&nodes[1], route, &vec!(&nodes[0])[..], 3000000);
 
 	let revoked_txn = get_local_commitment_txn!(nodes[0], chan.2);
@@ -7625,12 +7620,12 @@ fn test_bump_penalty_txn_on_revoked_commitment() {
 	}
 
 	// Connect blocks to change height_timer range to see if we use right soonest_timelock
-	let header_114 = connect_blocks(&nodes[1], 114, 0, false, Default::default());
+	let header_114 = connect_blocks(&nodes[1], 14);
 
 	// Actually revoke tx by claiming a HTLC
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
 	let header = BlockHeader { version: 0x20000000, prev_blockhash: header_114, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_txn[0].clone()] }, 115);
+	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_txn[0].clone()] });
 	check_added_monitors!(nodes[1], 1);
 
 	// One or more justice tx should have been broadcast, check it
@@ -7649,7 +7644,7 @@ fn test_bump_penalty_txn_on_revoked_commitment() {
 	};
 
 	// After exhaustion of height timer, a new bumped justice tx should have been broadcast, check it
-	let header = connect_blocks(&nodes[1], 3, 115,  true, header.block_hash());
+	connect_blocks(&nodes[1], 15);
 	let mut penalty_2 = penalty_1;
 	let mut feerate_2 = 0;
 	{
@@ -7672,7 +7667,7 @@ fn test_bump_penalty_txn_on_revoked_commitment() {
 	assert_ne!(feerate_2, 0);
 
 	// After exhaustion of height timer for a 2nd time, a new bumped justice tx should have been broadcast, check it
-	connect_blocks(&nodes[1], 3, 118, true, header);
+	connect_blocks(&nodes[1], 1);
 	let penalty_3;
 	let mut feerate_3 = 0;
 	{
@@ -7703,7 +7698,8 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 	// In case of penalty txn with too low feerates for getting into mempools, RBF-bump them to sure
 	// we're able to claim outputs on revoked HTLC transactions before timelocks expiration
 
-	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[1].keys_manager.disable_revocation_policy_check = true;
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
@@ -7720,9 +7716,9 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 	// Revoke local commitment tx
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 3_000_000);
 
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	// B will generate both revoked HTLC-timeout/HTLC-preimage txn from revoked commitment tx
-	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] }, 1);
+	connect_block(&nodes[1], &Block { header, txdata: vec![revoked_local_txn[0].clone()] });
 	check_closed_broadcast!(nodes[1], false);
 	check_added_monitors!(nodes[1], 1);
 
@@ -7745,11 +7741,12 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 	}
 
 	// Broadcast set of revoked txn on A
-	let header_128 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_128, txdata: vec![revoked_local_txn[0].clone()] }, 128);
+	let hash_128 = connect_blocks(&nodes[0], 40);
+	let header_11 = BlockHeader { version: 0x20000000, prev_blockhash: hash_128, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header: header_11, txdata: vec![revoked_local_txn[0].clone()] });
+	let header_129 = BlockHeader { version: 0x20000000, prev_blockhash: header_11.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header: header_129, txdata: vec![revoked_htlc_txn[0].clone(), revoked_htlc_txn[1].clone()] });
 	expect_pending_htlcs_forwardable_ignore!(nodes[0]);
-	let header_129 = BlockHeader { version: 0x20000000, prev_blockhash: header_128.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_129, txdata: vec![revoked_htlc_txn[0].clone(), revoked_htlc_txn[1].clone()] }, 129);
 	let first;
 	let feerate_1;
 	let penalty_txn;
@@ -7800,9 +7797,9 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 
 	// Connect one more block to see if bumped penalty are issued for HTLC txn
 	let header_130 = BlockHeader { version: 0x20000000, prev_blockhash: header_129.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_130, txdata: penalty_txn }, 130);
+	connect_block(&nodes[0], &Block { header: header_130, txdata: penalty_txn });
 	let header_131 = BlockHeader { version: 0x20000000, prev_blockhash: header_130.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_131, txdata: Vec::new() }, 131);
+	connect_block(&nodes[0], &Block { header: header_131, txdata: Vec::new() });
 	{
 		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		assert_eq!(node_txn.len(), 2); // 2 bumped penalty txn on revoked commitment tx
@@ -7821,9 +7818,9 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 	};
 
 	// Few more blocks to confirm penalty txn
-	let header_135 = connect_blocks(&nodes[0], 4, 131, true, header_131.block_hash());
+	connect_blocks(&nodes[0], 4);
 	assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
-	let header_144 = connect_blocks(&nodes[0], 9, 135, true, header_135);
+	let header_144 = connect_blocks(&nodes[0], 9);
 	let node_txn = {
 		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		assert_eq!(node_txn.len(), 1);
@@ -7841,8 +7838,8 @@ fn test_bump_penalty_txn_on_revoked_htlcs() {
 	};
 	// Broadcast claim txn and confirm blocks to avoid further bumps on this outputs
 	let header_145 = BlockHeader { version: 0x20000000, prev_blockhash: header_144, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_145, txdata: node_txn }, 145);
-	connect_blocks(&nodes[0], 20, 145, true, header_145.block_hash());
+	connect_block(&nodes[0], &Block { header: header_145, txdata: node_txn });
+	connect_blocks(&nodes[0], 20);
 	{
 		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		// We verify than no new transaction has been broadcast because previously
@@ -7884,8 +7881,7 @@ fn test_bump_penalty_txn_on_remote_commitment() {
 
 	// Claim a HTLC without revocation (provide B monitor with preimage)
 	nodes[1].node.claim_funds(payment_preimage, &None, 3_000_000);
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[1], &Block { header, txdata: vec![remote_txn[0].clone()] }, 1);
+	mine_transaction(&nodes[1], &remote_txn[0]);
 	check_added_monitors!(nodes[1], 2);
 
 	// One or more claim tx should have been broadcast, check it
@@ -7930,7 +7926,7 @@ fn test_bump_penalty_txn_on_remote_commitment() {
 	assert_ne!(feerate_preimage, 0);
 
 	// After exhaustion of height timer, new bumped claim txn should have been broadcast, check it
-	connect_blocks(&nodes[1], 15, 1,  true, header.block_hash());
+	connect_blocks(&nodes[1], 15);
 	{
 		let mut node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		assert_eq!(node_txn.len(), 2);
@@ -7971,109 +7967,12 @@ fn test_bump_penalty_txn_on_remote_commitment() {
 }
 
 #[test]
-fn test_set_outpoints_partial_claiming() {
-	// - remote party claim tx, new bump tx
-	// - disconnect remote claiming tx, new bump
-	// - disconnect tx, see no tx anymore
-	let chanmon_cfgs = create_chanmon_cfgs(2);
-	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-
-	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 59000000, InitFeatures::known(), InitFeatures::known());
-	let payment_preimage_1 = route_payment(&nodes[1], &vec!(&nodes[0])[..], 3_000_000).0;
-	let payment_preimage_2 = route_payment(&nodes[1], &vec!(&nodes[0])[..], 3_000_000).0;
-
-	// Remote commitment txn with 4 outputs: to_local, to_remote, 2 outgoing HTLC
-	let remote_txn = get_local_commitment_txn!(nodes[1], chan.2);
-	assert_eq!(remote_txn.len(), 3);
-	assert_eq!(remote_txn[0].output.len(), 4);
-	assert_eq!(remote_txn[0].input.len(), 1);
-	assert_eq!(remote_txn[0].input[0].previous_output.txid, chan.3.txid());
-	check_spends!(remote_txn[1], remote_txn[0]);
-	check_spends!(remote_txn[2], remote_txn[0]);
-
-	// Connect blocks on node A to advance height towards TEST_FINAL_CLTV
-	let prev_header_100 = connect_blocks(&nodes[1], 100, 0, false, Default::default());
-	// Provide node A with both preimage
-	nodes[0].node.claim_funds(payment_preimage_1, &None, 3_000_000);
-	nodes[0].node.claim_funds(payment_preimage_2, &None, 3_000_000);
-	check_added_monitors!(nodes[0], 2);
-	nodes[0].node.get_and_clear_pending_events();
-	nodes[0].node.get_and_clear_pending_msg_events();
-
-	// Connect blocks on node A commitment transaction
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: prev_header_100, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![remote_txn[0].clone()] }, 101);
-	check_closed_broadcast!(nodes[0], false);
-	check_added_monitors!(nodes[0], 1);
-	// Verify node A broadcast tx claiming both HTLCs
-	{
-		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		// ChannelMonitor: claim tx, ChannelManager: local commitment tx + HTLC-Success*2
-		assert_eq!(node_txn.len(), 4);
-		check_spends!(node_txn[0], remote_txn[0]);
-		check_spends!(node_txn[1], chan.3);
-		check_spends!(node_txn[2], node_txn[1]);
-		check_spends!(node_txn[3], node_txn[1]);
-		assert_eq!(node_txn[0].input.len(), 2);
-		node_txn.clear();
-	}
-
-	// Connect blocks on node B
-	connect_blocks(&nodes[1], 135, 0, false, Default::default());
-	check_closed_broadcast!(nodes[1], false);
-	check_added_monitors!(nodes[1], 1);
-	// Verify node B broadcast 2 HTLC-timeout txn
-	let partial_claim_tx = {
-		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		assert_eq!(node_txn.len(), 3);
-		check_spends!(node_txn[1], node_txn[0]);
-		check_spends!(node_txn[2], node_txn[0]);
-		assert_eq!(node_txn[1].input.len(), 1);
-		assert_eq!(node_txn[2].input.len(), 1);
-		node_txn[1].clone()
-	};
-
-	// Broadcast partial claim on node A, should regenerate a claiming tx with HTLC dropped
-	let header = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header, txdata: vec![partial_claim_tx.clone()] }, 102);
-	{
-		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		assert_eq!(node_txn.len(), 1);
-		check_spends!(node_txn[0], remote_txn[0]);
-		assert_eq!(node_txn[0].input.len(), 1); //dropped HTLC
-		node_txn.clear();
-	}
-	nodes[0].node.get_and_clear_pending_msg_events();
-
-	// Disconnect last block on node A, should regenerate a claiming tx with HTLC dropped
-	disconnect_block(&nodes[0], &header, 102);
-	{
-		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		assert_eq!(node_txn.len(), 1);
-		check_spends!(node_txn[0], remote_txn[0]);
-		assert_eq!(node_txn[0].input.len(), 2); //resurrected HTLC
-		node_txn.clear();
-	}
-
-	//// Disconnect one more block and then reconnect multiple no transaction should be generated
-	disconnect_block(&nodes[0], &header, 101);
-	connect_blocks(&nodes[1], 15, 101, false, prev_header_100);
-	{
-		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		assert_eq!(node_txn.len(), 0);
-		node_txn.clear();
-	}
-}
-
-#[test]
 fn test_counterparty_raa_skip_no_crash() {
 	// Previously, if our counterparty sent two RAAs in a row without us having provided a
 	// commitment transaction, we would have happily carried on and provided them the next
 	// commitment transaction based on one RAA forward. This would probably eventually have led to
 	// channel closure, but it would not have resulted in funds loss. Still, our
-	// EnforcingChannelKeys would have paniced as it doesn't like jumps into the future. Here, we
+	// EnforcingSigner would have paniced as it doesn't like jumps into the future. Here, we
 	// check simply that the channel is closed in response to such an RAA, but don't check whether
 	// we decide to punish our counterparty for revoking their funds (as we don't currently
 	// implement that).
@@ -8084,11 +7983,13 @@ fn test_counterparty_raa_skip_no_crash() {
 	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known()).2;
 
 	let mut guard = nodes[0].node.channel_state.lock().unwrap();
-	let keys = &guard.by_id.get_mut(&channel_id).unwrap().holder_keys;
+	let keys = &guard.by_id.get_mut(&channel_id).unwrap().get_signer();
 	const INITIAL_COMMITMENT_NUMBER: u64 = (1 << 48) - 1;
+	let per_commitment_secret = keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER);
+	// Must revoke without gaps
+	keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER - 1);
 	let next_per_commitment_point = PublicKey::from_secret_key(&Secp256k1::new(),
 		&SecretKey::from_slice(&keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER - 2)).unwrap());
-	let per_commitment_secret = keys.release_commitment_secret(INITIAL_COMMITMENT_NUMBER);
 
 	nodes[1].node.handle_revoke_and_ack(&nodes[0].node.get_our_node_id(),
 		&msgs::RevokeAndACK { channel_id, per_commitment_secret, next_per_commitment_point });
@@ -8119,11 +8020,11 @@ fn test_bump_txn_sanitize_tracking_maps() {
 	claim_payment(&nodes[0], &vec!(&nodes[1])[..], payment_preimage, 9_000_000);
 
 	// Broadcast set of revoked txn on A
-	let header_128 = connect_blocks(&nodes[0], 128, 0,  false, Default::default());
+	connect_blocks(&nodes[0], 52 - CHAN_CONFIRM_DEPTH);
 	expect_pending_htlcs_forwardable_ignore!(nodes[0]);
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 0);
 
-	let header_129 = BlockHeader { version: 0x20000000, prev_blockhash: header_128, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_129, txdata: vec![revoked_local_txn[0].clone()] }, 129);
+	mine_transaction(&nodes[0], &revoked_local_txn[0]);
 	check_closed_broadcast!(nodes[0], false);
 	check_added_monitors!(nodes[0], 1);
 	let penalty_txn = {
@@ -8136,14 +8037,14 @@ fn test_bump_txn_sanitize_tracking_maps() {
 		node_txn.clear();
 		penalty_txn
 	};
-	let header_130 = BlockHeader { version: 0x20000000, prev_blockhash: header_129.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	connect_block(&nodes[0], &Block { header: header_130, txdata: penalty_txn }, 130);
-	connect_blocks(&nodes[0], 5, 130,  false, header_130.block_hash());
+	let header_130 = BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header: header_130, txdata: penalty_txn });
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
 	{
-		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap();
+		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap();
 		if let Some(monitor) = monitors.get(&OutPoint { txid: chan.3.txid(), index: 0 }) {
-			assert!(monitor.onchain_tx_handler.pending_claim_requests.is_empty());
-			assert!(monitor.onchain_tx_handler.claimable_outpoints.is_empty());
+			assert!(monitor.inner.lock().unwrap().onchain_tx_handler.pending_claim_requests.is_empty());
+			assert!(monitor.inner.lock().unwrap().onchain_tx_handler.claimable_outpoints.is_empty());
 		}
 	}
 }
@@ -8201,7 +8102,7 @@ fn test_simple_payment_secret() {
 	let (payment_preimage, payment_hash) = get_payment_preimage_hash!(&nodes[0]);
 	let payment_secret = PaymentSecret([0xdb; 32]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	send_along_route_with_secret(&nodes[0], route, &[&[&nodes[1], &nodes[2]]], 100000, payment_hash, Some(payment_secret.clone()));
 	// Claiming with all the correct values but the wrong secret should result in nothing...
 	assert_eq!(nodes[2].node.claim_funds(payment_preimage, &None, 100_000), false);
@@ -8227,7 +8128,7 @@ fn test_simple_mpp() {
 	let (payment_preimage, payment_hash) = get_payment_preimage_hash!(&nodes[0]);
 	let payment_secret = PaymentSecret([0xdb; 32]);
 	let net_graph_msg_handler = &nodes[0].net_graph_msg_handler;
-	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[3].node.get_our_node_id(), None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
+	let mut route = get_route(&nodes[0].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[3].node.get_our_node_id(), None, None, &[], 100000, TEST_FINAL_CLTV, &logger).unwrap();
 	let path = route.paths[0].clone();
 	route.paths.push(path);
 	route.paths[0][0].pubkey = nodes[1].node.get_our_node_id();
@@ -8274,14 +8175,14 @@ fn test_update_err_monitor_lockdown() {
 	let logger = test_utils::TestLogger::with_id(format!("node {}", 0));
 	let persister = test_utils::TestPersister::new();
 	let watchtower = {
-		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap();
+		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap();
 		let monitor = monitors.get(&outpoint).unwrap();
 		let mut w = test_utils::TestVecWriter(Vec::new());
 		monitor.write(&mut w).unwrap();
-		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::read(
+		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
 				&mut ::std::io::Cursor::new(&w.0), &test_utils::OnlyReadsKeysInterface {}).unwrap().1;
 		assert!(new_monitor == *monitor);
-		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister);
+		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister, &node_cfgs[0].keys_manager);
 		assert!(watchtower.watch_channel(outpoint, new_monitor).is_ok());
 		watchtower
 	};
@@ -8333,19 +8234,19 @@ fn test_concurrent_monitor_claim() {
 	let logger = test_utils::TestLogger::with_id(format!("node {}", "Alice"));
 	let persister = test_utils::TestPersister::new();
 	let watchtower_alice = {
-		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap();
+		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap();
 		let monitor = monitors.get(&outpoint).unwrap();
 		let mut w = test_utils::TestVecWriter(Vec::new());
 		monitor.write(&mut w).unwrap();
-		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::read(
+		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
 				&mut ::std::io::Cursor::new(&w.0), &test_utils::OnlyReadsKeysInterface {}).unwrap().1;
 		assert!(new_monitor == *monitor);
-		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister);
+		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister, &node_cfgs[0].keys_manager);
 		assert!(watchtower.watch_channel(outpoint, new_monitor).is_ok());
 		watchtower
 	};
 	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	watchtower_alice.chain_monitor.block_connected(&header, &vec![], 135);
+	watchtower_alice.chain_monitor.block_connected(&header, &vec![], CHAN_CONFIRM_DEPTH + 1 + TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS);
 
 	// Watchtower Alice should have broadcast a commitment/HTLC-timeout
 	{
@@ -8359,25 +8260,25 @@ fn test_concurrent_monitor_claim() {
 	let logger = test_utils::TestLogger::with_id(format!("node {}", "Bob"));
 	let persister = test_utils::TestPersister::new();
 	let watchtower_bob = {
-		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.lock().unwrap();
+		let monitors = nodes[0].chain_monitor.chain_monitor.monitors.read().unwrap();
 		let monitor = monitors.get(&outpoint).unwrap();
 		let mut w = test_utils::TestVecWriter(Vec::new());
 		monitor.write(&mut w).unwrap();
-		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::read(
+		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
 				&mut ::std::io::Cursor::new(&w.0), &test_utils::OnlyReadsKeysInterface {}).unwrap().1;
 		assert!(new_monitor == *monitor);
-		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister);
+		let watchtower = test_utils::TestChainMonitor::new(Some(&chain_source), &chanmon_cfgs[0].tx_broadcaster, &logger, &chanmon_cfgs[0].fee_estimator, &persister, &node_cfgs[0].keys_manager);
 		assert!(watchtower.watch_channel(outpoint, new_monitor).is_ok());
 		watchtower
 	};
 	let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-	watchtower_bob.chain_monitor.block_connected(&header, &vec![], 134);
+	watchtower_bob.chain_monitor.block_connected(&header, &vec![], CHAN_CONFIRM_DEPTH + TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS);
 
 	// Route another payment to generate another update with still previous HTLC pending
 	let (_, payment_hash) = get_payment_preimage_hash!(nodes[0]);
 	{
 		let net_graph_msg_handler = &nodes[1].net_graph_msg_handler;
-		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, &Vec::new(), 3000000 , TEST_FINAL_CLTV, &logger).unwrap();
+		let route = get_route(&nodes[1].node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[0].node.get_our_node_id(), None, None, &Vec::new(), 3000000 , TEST_FINAL_CLTV, &logger).unwrap();
 		nodes[1].node.send_payment(&route, payment_hash, &None).unwrap();
 	}
 	check_added_monitors!(nodes[1], 1);
@@ -8397,7 +8298,7 @@ fn test_concurrent_monitor_claim() {
 	check_added_monitors!(nodes[0], 1);
 
 	//// Provide one more block to watchtower Bob, expect broadcast of commitment and HTLC-Timeout
-	watchtower_bob.chain_monitor.block_connected(&header, &vec![], 135);
+	watchtower_bob.chain_monitor.block_connected(&header, &vec![], CHAN_CONFIRM_DEPTH + 1 + TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS);
 
 	// Watchtower Bob should have broadcast a commitment/HTLC-timeout
 	let bob_state_y;
@@ -8409,7 +8310,7 @@ fn test_concurrent_monitor_claim() {
 	};
 
 	// We confirm Bob's state Y on Alice, she should broadcast a HTLC-timeout
-	watchtower_alice.chain_monitor.block_connected(&header, &vec![(0, &bob_state_y)], 136);
+	watchtower_alice.chain_monitor.block_connected(&header, &vec![(0, &bob_state_y)], CHAN_CONFIRM_DEPTH + 2 + TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS);
 	{
 		let htlc_txn = chanmon_cfgs[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		// We broadcast twice the transaction, once due to the HTLC-timeout, once due
@@ -8460,48 +8361,48 @@ fn test_pre_lockin_no_chan_closed_update() {
 #[test]
 fn test_htlc_no_detection() {
 	// This test is a mutation to underscore the detection logic bug we had
-        // before #653. HTLC value routed is above the remaining balance, thus
-        // inverting HTLC and `to_remote` output. HTLC will come second and
-        // it wouldn't be seen by pre-#653 detection as we were enumerate()'ing
-        // on a watched outputs vector (Vec<TxOut>) thus implicitly relying on
-        // outputs order detection for correct spending children filtring.
+	// before #653. HTLC value routed is above the remaining balance, thus
+	// inverting HTLC and `to_remote` output. HTLC will come second and
+	// it wouldn't be seen by pre-#653 detection as we were enumerate()'ing
+	// on a watched outputs vector (Vec<TxOut>) thus implicitly relying on
+	// outputs order detection for correct spending children filtring.
 
-        let chanmon_cfgs = create_chanmon_cfgs(2);
-        let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-        let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-        let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-        // Create some initial channels
-        let chan_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001, InitFeatures::known(), InitFeatures::known());
+	// Create some initial channels
+	let chan_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001, InitFeatures::known(), InitFeatures::known());
 
-        send_payment(&nodes[0], &vec!(&nodes[1])[..], 1_000_000, 1_000_000);
-        let (_, our_payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1])[..], 2_000_000);
-        let local_txn = get_local_commitment_txn!(nodes[0], chan_1.2);
-        assert_eq!(local_txn[0].input.len(), 1);
-        assert_eq!(local_txn[0].output.len(), 3);
-        check_spends!(local_txn[0], chan_1.3);
+	send_payment(&nodes[0], &vec!(&nodes[1])[..], 1_000_000, 1_000_000);
+	let (_, our_payment_hash) = route_payment(&nodes[0], &vec!(&nodes[1])[..], 2_000_000);
+	let local_txn = get_local_commitment_txn!(nodes[0], chan_1.2);
+	assert_eq!(local_txn[0].input.len(), 1);
+	assert_eq!(local_txn[0].output.len(), 3);
+	check_spends!(local_txn[0], chan_1.3);
 
-        // Timeout HTLC on A's chain and so it can generate a HTLC-Timeout tx
-        let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-        connect_block(&nodes[0], &Block { header, txdata: vec![local_txn[0].clone()] }, 200);
+	// Timeout HTLC on A's chain and so it can generate a HTLC-Timeout tx
+	let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header, txdata: vec![local_txn[0].clone()] });
 	// We deliberately connect the local tx twice as this should provoke a failure calling
 	// this test before #653 fix.
-        connect_block(&nodes[0], &Block { header, txdata: vec![local_txn[0].clone()] }, 200);
-        check_closed_broadcast!(nodes[0], false);
-        check_added_monitors!(nodes[0], 1);
+	chain::Listen::block_connected(&nodes[0].chain_monitor.chain_monitor, &Block { header, txdata: vec![local_txn[0].clone()] }, nodes[0].best_block_info().1 + 1);
+	check_closed_broadcast!(nodes[0], false);
+	check_added_monitors!(nodes[0], 1);
 
-        let htlc_timeout = {
-                let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-                assert_eq!(node_txn[0].input.len(), 1);
-                assert_eq!(node_txn[0].input[0].witness.last().unwrap().len(), OFFERED_HTLC_SCRIPT_WEIGHT);
-                check_spends!(node_txn[0], local_txn[0]);
-                node_txn[0].clone()
-        };
+	let htlc_timeout = {
+		let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		assert_eq!(node_txn[0].input.len(), 1);
+		assert_eq!(node_txn[0].input[0].witness.last().unwrap().len(), OFFERED_HTLC_SCRIPT_WEIGHT);
+		check_spends!(node_txn[0], local_txn[0]);
+		node_txn[0].clone()
+	};
 
-        let header_201 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-        connect_block(&nodes[0], &Block { header: header_201, txdata: vec![htlc_timeout.clone()] }, 201);
-        connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1, 201, true, header_201.block_hash());
-        expect_payment_failed!(nodes[0], our_payment_hash, true);
+	let header_201 = BlockHeader { version: 0x20000000, prev_blockhash: header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+	connect_block(&nodes[0], &Block { header: header_201, txdata: vec![htlc_timeout.clone()] });
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
+	expect_payment_failed!(nodes[0], our_payment_hash, true);
 }
 
 fn do_test_onchain_htlc_settlement_after_close(broadcast_alice: bool, go_onchain_before_fulfill: bool) {
@@ -8544,7 +8445,7 @@ fn do_test_onchain_htlc_settlement_after_close(broadcast_alice: bool, go_onchain
 	// responds by (1) broadcasting a channel update and (2) adding a new ChannelMonitor.
 	let mut force_closing_node = 0; // Alice force-closes
 	if !broadcast_alice { force_closing_node = 1; } // Bob force-closes
-	nodes[force_closing_node].node.force_close_channel(&chan_ab.2);
+	nodes[force_closing_node].node.force_close_channel(&chan_ab.2).unwrap();
 	check_closed_broadcast!(nodes[force_closing_node], false);
 	check_added_monitors!(nodes[force_closing_node], 1);
 	if go_onchain_before_fulfill {
@@ -8552,8 +8453,8 @@ fn do_test_onchain_htlc_settlement_after_close(broadcast_alice: bool, go_onchain
 			true => alice_txn.clone(),
 			false => get_local_commitment_txn!(nodes[1], chan_ab.2)
 		};
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-		connect_block(&nodes[1], &Block { header, txdata: vec![txn_to_broadcast[0].clone()]}, 1);
+		let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
+		connect_block(&nodes[1], &Block { header, txdata: vec![txn_to_broadcast[0].clone()]});
 		let mut bob_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		if broadcast_alice {
 			check_closed_broadcast!(nodes[1], false);
@@ -8631,8 +8532,8 @@ fn do_test_onchain_htlc_settlement_after_close(broadcast_alice: bool, go_onchain
 	let mut txn_to_broadcast = alice_txn.clone();
 	if !broadcast_alice { txn_to_broadcast = get_local_commitment_txn!(nodes[1], chan_ab.2); }
 	if !go_onchain_before_fulfill {
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
-		connect_block(&nodes[1], &Block { header, txdata: vec![txn_to_broadcast[0].clone()]}, 1);
+		let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42};
+		connect_block(&nodes[1], &Block { header, txdata: vec![txn_to_broadcast[0].clone()]});
 		// If Bob was the one to force-close, he will have already passed these checks earlier.
 		if broadcast_alice {
 			check_closed_broadcast!(nodes[1], false);
@@ -8826,4 +8727,67 @@ fn test_duplicate_chan_id() {
 	let (announcement, as_update, bs_update) = create_chan_between_nodes_with_value_b(&nodes[0], &nodes[1], &funding_locked);
 	update_nodes_with_chan_announce(&nodes, 0, 1, &announcement, &as_update, &bs_update);
 	send_payment(&nodes[0], &[&nodes[1]], 8000000, 8_000_000);
+}
+
+#[test]
+fn test_error_chans_closed() {
+	// Test that we properly handle error messages, closing appropriate channels.
+	//
+	// Prior to #787 we'd allow a peer to make us force-close a channel we had with a different
+	// peer. The "real" fix for that is to index channels with peers_ids, however in the mean time
+	// we can test various edge cases around it to ensure we don't regress.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	// Create some initial channels
+	let chan_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001, InitFeatures::known(), InitFeatures::known());
+	let chan_2 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001, InitFeatures::known(), InitFeatures::known());
+	let chan_3 = create_announced_chan_between_nodes_with_value(&nodes, 0, 2, 100000, 10001, InitFeatures::known(), InitFeatures::known());
+
+	assert_eq!(nodes[0].node.list_usable_channels().len(), 3);
+	assert_eq!(nodes[1].node.list_usable_channels().len(), 2);
+	assert_eq!(nodes[2].node.list_usable_channels().len(), 1);
+
+	// Closing a channel from a different peer has no effect
+	nodes[0].node.handle_error(&nodes[1].node.get_our_node_id(), &msgs::ErrorMessage { channel_id: chan_3.2, data: "ERR".to_owned() });
+	assert_eq!(nodes[0].node.list_usable_channels().len(), 3);
+
+	// Closing one channel doesn't impact others
+	nodes[0].node.handle_error(&nodes[1].node.get_our_node_id(), &msgs::ErrorMessage { channel_id: chan_2.2, data: "ERR".to_owned() });
+	check_added_monitors!(nodes[0], 1);
+	check_closed_broadcast!(nodes[0], false);
+	assert_eq!(nodes[0].node.list_usable_channels().len(), 2);
+	assert!(nodes[0].node.list_usable_channels()[0].channel_id == chan_1.2 || nodes[0].node.list_usable_channels()[1].channel_id == chan_1.2);
+	assert!(nodes[0].node.list_usable_channels()[0].channel_id == chan_3.2 || nodes[0].node.list_usable_channels()[1].channel_id == chan_3.2);
+
+	// A null channel ID should close all channels
+	let _chan_4 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001, InitFeatures::known(), InitFeatures::known());
+	nodes[0].node.handle_error(&nodes[1].node.get_our_node_id(), &msgs::ErrorMessage { channel_id: [0; 32], data: "ERR".to_owned() });
+	check_added_monitors!(nodes[0], 2);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	match events[0] {
+		MessageSendEvent::BroadcastChannelUpdate { ref msg } => {
+			assert_eq!(msg.contents.flags & 2, 2);
+		},
+		_ => panic!("Unexpected event"),
+	}
+	match events[1] {
+		MessageSendEvent::BroadcastChannelUpdate { ref msg } => {
+			assert_eq!(msg.contents.flags & 2, 2);
+		},
+		_ => panic!("Unexpected event"),
+	}
+	// Note that at this point users of a standard PeerHandler will end up calling
+	// peer_disconnected with no_connection_possible set to false, duplicating the
+	// close-all-channels logic. That's OK, we don't want to end up not force-closing channels for
+	// users with their own peer handling logic. We duplicate the call here, however.
+	assert_eq!(nodes[0].node.list_usable_channels().len(), 1);
+	assert!(nodes[0].node.list_usable_channels()[0].channel_id == chan_3.2);
+
+	nodes[0].node.peer_disconnected(&nodes[1].node.get_our_node_id(), true);
+	assert_eq!(nodes[0].node.list_usable_channels().len(), 1);
+	assert!(nodes[0].node.list_usable_channels()[0].channel_id == chan_3.2);
 }

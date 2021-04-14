@@ -8,6 +8,7 @@
 // licenses.
 
 use chain;
+use chain::WatchedOutput;
 use chain::chaininterface;
 use chain::chaininterface::ConfirmationTarget;
 use chain::chainmonitor;
@@ -18,7 +19,7 @@ use chain::keysinterface;
 use ln::features::{ChannelFeatures, InitFeatures};
 use ln::msgs;
 use ln::msgs::OptionalField;
-use util::enforcing_trait_impls::EnforcingChannelKeys;
+use util::enforcing_trait_impls::{EnforcingSigner, INITIAL_REVOKED_COMMITMENT_NUMBER};
 use util::events;
 use util::logger::{Logger, Level, Record};
 use util::ser::{Readable, ReadableArgs, Writer, Writeable};
@@ -35,10 +36,11 @@ use bitcoin::secp256k1::{SecretKey, PublicKey, Secp256k1, Signature};
 use regex;
 
 use std::time::Duration;
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{cmp, mem};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use chain::keysinterface::InMemorySigner;
 
 pub struct TestVecWriter(pub Vec<u8>);
 impl Writer for TestVecWriter {
@@ -62,49 +64,54 @@ impl chaininterface::FeeEstimator for TestFeeEstimator {
 
 pub struct OnlyReadsKeysInterface {}
 impl keysinterface::KeysInterface for OnlyReadsKeysInterface {
-	type ChanKeySigner = EnforcingChannelKeys;
+	type Signer = EnforcingSigner;
 
 	fn get_node_secret(&self) -> SecretKey { unreachable!(); }
 	fn get_destination_script(&self) -> Script { unreachable!(); }
 	fn get_shutdown_pubkey(&self) -> PublicKey { unreachable!(); }
-	fn get_channel_keys(&self, _inbound: bool, _channel_value_satoshis: u64) -> EnforcingChannelKeys { unreachable!(); }
-	fn get_secure_random_bytes(&self) -> [u8; 32] { unreachable!(); }
+	fn get_channel_signer(&self, _inbound: bool, _channel_value_satoshis: u64) -> EnforcingSigner { unreachable!(); }
+	fn get_secure_random_bytes(&self) -> [u8; 32] { [0; 32] }
 
-	fn read_chan_signer(&self, reader: &[u8]) -> Result<Self::ChanKeySigner, msgs::DecodeError> {
-		EnforcingChannelKeys::read(&mut std::io::Cursor::new(reader))
+	fn read_chan_signer(&self, reader: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
+		EnforcingSigner::read(&mut std::io::Cursor::new(reader))
 	}
 }
 
 pub struct TestChainMonitor<'a> {
-	pub added_monitors: Mutex<Vec<(OutPoint, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>>,
+	pub added_monitors: Mutex<Vec<(OutPoint, channelmonitor::ChannelMonitor<EnforcingSigner>)>>,
 	pub latest_monitor_update_id: Mutex<HashMap<[u8; 32], (OutPoint, u64)>>,
-	pub chain_monitor: chainmonitor::ChainMonitor<EnforcingChannelKeys, &'a TestChainSource, &'a chaininterface::BroadcasterInterface, &'a TestFeeEstimator, &'a TestLogger, &'a channelmonitor::Persist<EnforcingChannelKeys>>,
+	pub chain_monitor: chainmonitor::ChainMonitor<EnforcingSigner, &'a TestChainSource, &'a chaininterface::BroadcasterInterface, &'a TestFeeEstimator, &'a TestLogger, &'a channelmonitor::Persist<EnforcingSigner>>,
+	pub keys_manager: &'a TestKeysInterface,
 	pub update_ret: Mutex<Option<Result<(), channelmonitor::ChannelMonitorUpdateErr>>>,
-	// If this is set to Some(), after the next return, we'll always return this until update_ret
-	// is changed:
+	/// If this is set to Some(), after the next return, we'll always return this until update_ret
+	/// is changed:
 	pub next_update_ret: Mutex<Option<Result<(), channelmonitor::ChannelMonitorUpdateErr>>>,
+	/// If this is set to Some(), the next update_channel call (not watch_channel) must be a
+	/// ChannelForceClosed event for the given channel_id with should_broadcast set to the given
+	/// boolean.
+	pub expect_channel_force_closed: Mutex<Option<([u8; 32], bool)>>,
 }
 impl<'a> TestChainMonitor<'a> {
-	pub fn new(chain_source: Option<&'a TestChainSource>, broadcaster: &'a chaininterface::BroadcasterInterface, logger: &'a TestLogger, fee_estimator: &'a TestFeeEstimator, persister: &'a channelmonitor::Persist<EnforcingChannelKeys>) -> Self {
+	pub fn new(chain_source: Option<&'a TestChainSource>, broadcaster: &'a chaininterface::BroadcasterInterface, logger: &'a TestLogger, fee_estimator: &'a TestFeeEstimator, persister: &'a channelmonitor::Persist<EnforcingSigner>, keys_manager: &'a TestKeysInterface) -> Self {
 		Self {
 			added_monitors: Mutex::new(Vec::new()),
 			latest_monitor_update_id: Mutex::new(HashMap::new()),
 			chain_monitor: chainmonitor::ChainMonitor::new(chain_source, broadcaster, logger, fee_estimator, persister),
+			keys_manager,
 			update_ret: Mutex::new(None),
 			next_update_ret: Mutex::new(None),
+			expect_channel_force_closed: Mutex::new(None),
 		}
 	}
 }
-impl<'a> chain::Watch for TestChainMonitor<'a> {
-	type Keys = EnforcingChannelKeys;
-
-	fn watch_channel(&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<EnforcingChannelKeys>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
+impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
+	fn watch_channel(&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<EnforcingSigner>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
 		// At every point where we get a monitor update, we should be able to send a useful monitor
 		// to a watchtower and disk...
 		let mut w = TestVecWriter(Vec::new());
 		monitor.write(&mut w).unwrap();
-		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::read(
-			&mut ::std::io::Cursor::new(&w.0), &OnlyReadsKeysInterface {}).unwrap().1;
+		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
+			&mut ::std::io::Cursor::new(&w.0), self.keys_manager).unwrap().1;
 		assert!(new_monitor == monitor);
 		self.latest_monitor_update_id.lock().unwrap().insert(funding_txo.to_channel_id(), (funding_txo, monitor.get_latest_update_id()));
 		self.added_monitors.lock().unwrap().push((funding_txo, monitor));
@@ -128,16 +135,24 @@ impl<'a> chain::Watch for TestChainMonitor<'a> {
 		assert!(channelmonitor::ChannelMonitorUpdate::read(
 				&mut ::std::io::Cursor::new(&w.0)).unwrap() == update);
 
+		if let Some(exp) = self.expect_channel_force_closed.lock().unwrap().take() {
+			assert_eq!(funding_txo.to_channel_id(), exp.0);
+			assert_eq!(update.updates.len(), 1);
+			if let channelmonitor::ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast } = update.updates[0] {
+				assert_eq!(should_broadcast, exp.1);
+			} else { panic!(); }
+		}
+
 		self.latest_monitor_update_id.lock().unwrap().insert(funding_txo.to_channel_id(), (funding_txo, update.update_id));
 		let update_res = self.chain_monitor.update_channel(funding_txo, update);
 		// At every point where we get a monitor update, we should be able to send a useful monitor
 		// to a watchtower and disk...
-		let monitors = self.chain_monitor.monitors.lock().unwrap();
+		let monitors = self.chain_monitor.monitors.read().unwrap();
 		let monitor = monitors.get(&funding_txo).unwrap();
 		w.0.clear();
 		monitor.write(&mut w).unwrap();
-		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::read(
-			&mut ::std::io::Cursor::new(&w.0), &OnlyReadsKeysInterface {}).unwrap().1;
+		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
+			&mut ::std::io::Cursor::new(&w.0), self.keys_manager).unwrap().1;
 		assert!(new_monitor == *monitor);
 		self.added_monitors.lock().unwrap().push((funding_txo, new_monitor));
 
@@ -171,12 +186,12 @@ impl TestPersister {
 		*self.update_ret.lock().unwrap() = ret;
 	}
 }
-impl channelmonitor::Persist<EnforcingChannelKeys> for TestPersister {
-	fn persist_new_channel(&self, _funding_txo: OutPoint, _data: &channelmonitor::ChannelMonitor<EnforcingChannelKeys>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
+impl<Signer: keysinterface::Sign> channelmonitor::Persist<Signer> for TestPersister {
+	fn persist_new_channel(&self, _funding_txo: OutPoint, _data: &channelmonitor::ChannelMonitor<Signer>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
 		self.update_ret.lock().unwrap().clone()
 	}
 
-	fn update_persisted_channel(&self, _funding_txo: OutPoint, _update: &channelmonitor::ChannelMonitorUpdate, _data: &channelmonitor::ChannelMonitor<EnforcingChannelKeys>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
+	fn update_persisted_channel(&self, _funding_txo: OutPoint, _update: &channelmonitor::ChannelMonitorUpdate, _data: &channelmonitor::ChannelMonitor<Signer>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
 		self.update_ret.lock().unwrap().clone()
 	}
 }
@@ -208,7 +223,7 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_funding_created(&self, _their_node_id: &PublicKey, _msg: &msgs::FundingCreated) {}
 	fn handle_funding_signed(&self, _their_node_id: &PublicKey, _msg: &msgs::FundingSigned) {}
 	fn handle_funding_locked(&self, _their_node_id: &PublicKey, _msg: &msgs::FundingLocked) {}
-	fn handle_shutdown(&self, _their_node_id: &PublicKey, _msg: &msgs::Shutdown) {}
+	fn handle_shutdown(&self, _their_node_id: &PublicKey, _their_features: &InitFeatures, _msg: &msgs::Shutdown) {}
 	fn handle_closing_signed(&self, _their_node_id: &PublicKey, _msg: &msgs::ClosingSigned) {}
 	fn handle_update_add_htlc(&self, _their_node_id: &PublicKey, _msg: &msgs::UpdateAddHTLC) {}
 	fn handle_update_fulfill_htlc(&self, _their_node_id: &PublicKey, _msg: &msgs::UpdateFulfillHTLC) {}
@@ -217,6 +232,7 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_commitment_signed(&self, _their_node_id: &PublicKey, _msg: &msgs::CommitmentSigned) {}
 	fn handle_revoke_and_ack(&self, _their_node_id: &PublicKey, _msg: &msgs::RevokeAndACK) {}
 	fn handle_update_fee(&self, _their_node_id: &PublicKey, _msg: &msgs::UpdateFee) {}
+	fn handle_channel_update(&self, _their_node_id: &PublicKey, _msg: &msgs::ChannelUpdate) {}
 	fn handle_announcement_signatures(&self, _their_node_id: &PublicKey, _msg: &msgs::AnnouncementSignatures) {}
 	fn handle_channel_reestablish(&self, _their_node_id: &PublicKey, _msg: &msgs::ChannelReestablish) {}
 	fn peer_disconnected(&self, _their_node_id: &PublicKey, _no_connection_possible: bool) {}
@@ -252,12 +268,14 @@ fn get_dummy_channel_announcement(short_chan_id: u64) -> msgs::ChannelAnnounceme
 		excess_data: Vec::new(),
 	};
 
-	msgs::ChannelAnnouncement {
-		node_signature_1: Signature::from(FFISignature::new()),
-		node_signature_2: Signature::from(FFISignature::new()),
-		bitcoin_signature_1: Signature::from(FFISignature::new()),
-		bitcoin_signature_2: Signature::from(FFISignature::new()),
-		contents: unsigned_ann,
+	unsafe {
+		msgs::ChannelAnnouncement {
+			node_signature_1: Signature::from(FFISignature::new()),
+			node_signature_2: Signature::from(FFISignature::new()),
+			bitcoin_signature_1: Signature::from(FFISignature::new()),
+			bitcoin_signature_2: Signature::from(FFISignature::new()),
+			contents: unsigned_ann,
+		}
 	}
 }
 
@@ -265,7 +283,7 @@ fn get_dummy_channel_update(short_chan_id: u64) -> msgs::ChannelUpdate {
 	use bitcoin::secp256k1::ffi::Signature as FFISignature;
 	let network = Network::Testnet;
 	msgs::ChannelUpdate {
-		signature: Signature::from(FFISignature::new()),
+		signature: Signature::from(unsafe { FFISignature::new() }),
 		contents: msgs::UnsignedChannelUpdate {
 			chain_hash: genesis_block(network).header.block_hash(),
 			short_channel_id: short_chan_id,
@@ -416,19 +434,23 @@ impl Logger for TestLogger {
 }
 
 pub struct TestKeysInterface {
-	backing: keysinterface::KeysManager,
+	pub backing: keysinterface::KeysManager,
 	pub override_session_priv: Mutex<Option<[u8; 32]>>,
 	pub override_channel_id_priv: Mutex<Option<[u8; 32]>>,
+	pub disable_revocation_policy_check: bool,
+	revoked_commitments: Mutex<HashMap<[u8;32], Arc<Mutex<u64>>>>,
 }
 
 impl keysinterface::KeysInterface for TestKeysInterface {
-	type ChanKeySigner = EnforcingChannelKeys;
+	type Signer = EnforcingSigner;
 
 	fn get_node_secret(&self) -> SecretKey { self.backing.get_node_secret() }
 	fn get_destination_script(&self) -> Script { self.backing.get_destination_script() }
 	fn get_shutdown_pubkey(&self) -> PublicKey { self.backing.get_shutdown_pubkey() }
-	fn get_channel_keys(&self, inbound: bool, channel_value_satoshis: u64) -> EnforcingChannelKeys {
-		EnforcingChannelKeys::new(self.backing.get_channel_keys(inbound, channel_value_satoshis))
+	fn get_channel_signer(&self, inbound: bool, channel_value_satoshis: u64) -> EnforcingSigner {
+		let keys = self.backing.get_channel_signer(inbound, channel_value_satoshis);
+		let revoked_commitment = self.make_revoked_commitment_cell(keys.commitment_seed);
+		EnforcingSigner::new_with_revoked(keys, revoked_commitment, self.disable_revocation_policy_check)
 	}
 
 	fn get_secure_random_bytes(&self) -> [u8; 32] {
@@ -446,22 +468,48 @@ impl keysinterface::KeysInterface for TestKeysInterface {
 		self.backing.get_secure_random_bytes()
 	}
 
-	fn read_chan_signer(&self, reader: &[u8]) -> Result<Self::ChanKeySigner, msgs::DecodeError> {
-		EnforcingChannelKeys::read(&mut std::io::Cursor::new(reader))
+	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
+		let mut reader = std::io::Cursor::new(buffer);
+
+		let inner: InMemorySigner = Readable::read(&mut reader)?;
+		let revoked_commitment = self.make_revoked_commitment_cell(inner.commitment_seed);
+
+		let last_commitment_number = Readable::read(&mut reader)?;
+
+		Ok(EnforcingSigner {
+			inner,
+			last_commitment_number: Arc::new(Mutex::new(last_commitment_number)),
+			revoked_commitment,
+			disable_revocation_policy_check: self.disable_revocation_policy_check,
+		})
 	}
 }
+
 
 impl TestKeysInterface {
 	pub fn new(seed: &[u8; 32], network: Network) -> Self {
 		let now = Duration::from_secs(genesis_block(network).header.time as u64);
 		Self {
-			backing: keysinterface::KeysManager::new(seed, network, now.as_secs(), now.subsec_nanos()),
+			backing: keysinterface::KeysManager::new(seed, now.as_secs(), now.subsec_nanos()),
 			override_session_priv: Mutex::new(None),
 			override_channel_id_priv: Mutex::new(None),
+			disable_revocation_policy_check: false,
+			revoked_commitments: Mutex::new(HashMap::new()),
 		}
 	}
-	pub fn derive_channel_keys(&self, channel_value_satoshis: u64, user_id_1: u64, user_id_2: u64) -> EnforcingChannelKeys {
-		EnforcingChannelKeys::new(self.backing.derive_channel_keys(channel_value_satoshis, user_id_1, user_id_2))
+	pub fn derive_channel_keys(&self, channel_value_satoshis: u64, id: &[u8; 32]) -> EnforcingSigner {
+		let keys = self.backing.derive_channel_keys(channel_value_satoshis, id);
+		let revoked_commitment = self.make_revoked_commitment_cell(keys.commitment_seed);
+		EnforcingSigner::new_with_revoked(keys, revoked_commitment, self.disable_revocation_policy_check)
+	}
+
+	fn make_revoked_commitment_cell(&self, commitment_seed: [u8; 32]) -> Arc<Mutex<u64>> {
+		let mut revoked_commitments = self.revoked_commitments.lock().unwrap();
+		if !revoked_commitments.contains_key(&commitment_seed) {
+			revoked_commitments.insert(commitment_seed, Arc::new(Mutex::new(INITIAL_REVOKED_COMMITMENT_NUMBER)));
+		}
+		let cell = revoked_commitments.get(&commitment_seed).unwrap();
+		Arc::clone(cell)
 	}
 }
 
@@ -470,6 +518,7 @@ pub struct TestChainSource {
 	pub utxo_ret: Mutex<Result<TxOut, chain::AccessError>>,
 	pub watched_txn: Mutex<HashSet<(Txid, Script)>>,
 	pub watched_outputs: Mutex<HashSet<(OutPoint, Script)>>,
+	expectations: Mutex<Option<VecDeque<OnRegisterOutput>>>,
 }
 
 impl TestChainSource {
@@ -480,7 +529,16 @@ impl TestChainSource {
 			utxo_ret: Mutex::new(Ok(TxOut { value: u64::max_value(), script_pubkey })),
 			watched_txn: Mutex::new(HashSet::new()),
 			watched_outputs: Mutex::new(HashSet::new()),
+			expectations: Mutex::new(None),
 		}
+	}
+
+	/// Sets an expectation that [`chain::Filter::register_output`] is called.
+	pub fn expect(&self, expectation: OnRegisterOutput) -> &Self {
+		self.expectations.lock().unwrap()
+			.get_or_insert_with(|| VecDeque::new())
+			.push_back(expectation);
+		self
 	}
 }
 
@@ -499,7 +557,72 @@ impl chain::Filter for TestChainSource {
 		self.watched_txn.lock().unwrap().insert((*txid, script_pubkey.clone()));
 	}
 
-	fn register_output(&self, outpoint: &OutPoint, script_pubkey: &Script) {
-		self.watched_outputs.lock().unwrap().insert((*outpoint, script_pubkey.clone()));
+	fn register_output(&self, output: WatchedOutput) -> Option<(usize, Transaction)> {
+		let dependent_tx = match &mut *self.expectations.lock().unwrap() {
+			None => None,
+			Some(expectations) => match expectations.pop_front() {
+				None => {
+					panic!("Unexpected register_output: {:?}",
+						(output.outpoint, output.script_pubkey));
+				},
+				Some(expectation) => {
+					assert_eq!(output.outpoint, expectation.outpoint());
+					assert_eq!(&output.script_pubkey, expectation.script_pubkey());
+					expectation.returns
+				},
+			},
+		};
+
+		self.watched_outputs.lock().unwrap().insert((output.outpoint, output.script_pubkey));
+		dependent_tx
+	}
+}
+
+impl Drop for TestChainSource {
+	fn drop(&mut self) {
+		if std::thread::panicking() {
+			return;
+		}
+
+		if let Some(expectations) = &*self.expectations.lock().unwrap() {
+			if !expectations.is_empty() {
+				panic!("Unsatisfied expectations: {:?}", expectations);
+			}
+		}
+	}
+}
+
+/// An expectation that [`chain::Filter::register_output`] was called with a transaction output and
+/// returns an optional dependent transaction that spends the output in the same block.
+pub struct OnRegisterOutput {
+	/// The transaction output to register.
+	pub with: TxOutReference,
+
+	/// A dependent transaction spending the output along with its position in the block.
+	pub returns: Option<(usize, Transaction)>,
+}
+
+/// A transaction output as identified by an index into a transaction's output list.
+pub struct TxOutReference(pub Transaction, pub usize);
+
+impl OnRegisterOutput {
+	fn outpoint(&self) -> OutPoint {
+		let txid = self.with.0.txid();
+		let index = self.with.1 as u16;
+		OutPoint { txid, index }
+	}
+
+	fn script_pubkey(&self) -> &Script {
+		let index = self.with.1;
+		&self.with.0.output[index].script_pubkey
+	}
+}
+
+impl std::fmt::Debug for OnRegisterOutput {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("OnRegisterOutput")
+			.field("outpoint", &self.outpoint())
+			.field("script_pubkey", self.script_pubkey())
+			.finish()
 	}
 }

@@ -1,29 +1,41 @@
+//! Utilities that handle persisting Rust-Lightning data to disk via standard filesystem APIs.
+
+#![deny(broken_intra_doc_links)]
+#![deny(missing_docs)]
+
+#![cfg_attr(all(test, feature = "unstable"), feature(test))]
+#[cfg(all(test, feature = "unstable"))] extern crate test;
+
+mod util;
+
 extern crate lightning;
 extern crate bitcoin;
 extern crate libc;
 
 use bitcoin::hashes::hex::ToHex;
+use crate::util::DiskWriteable;
+use lightning::chain;
+use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateErr};
 use lightning::chain::channelmonitor;
-use lightning::chain::keysinterface::ChannelKeys;
+use lightning::chain::keysinterface::{Sign, KeysInterface};
 use lightning::chain::transaction::OutPoint;
+use lightning::ln::channelmanager::ChannelManager;
+use lightning::util::logger::Logger;
 use lightning::util::ser::Writeable;
 use std::fs;
 use std::io::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(test)]
 use {
-	lightning::chain::keysinterface::KeysInterface,
 	lightning::util::ser::ReadableArgs,
 	bitcoin::{BlockHash, Txid},
 	bitcoin::hashes::hex::FromHex,
 	std::collections::HashMap,
 	std::io::Cursor
 };
-
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::io::AsRawFd;
 
 /// FilesystemPersister persists channel data on disk, where each channel's
 /// data is stored in a file named after its funding outpoint.
@@ -41,13 +53,21 @@ pub struct FilesystemPersister {
 	path_to_channel_data: String,
 }
 
-trait DiskWriteable {
-	fn write(&self, writer: &mut fs::File) -> Result<(), Error>;
+impl<Signer: Sign> DiskWriteable for ChannelMonitor<Signer> {
+	fn write_to_file(&self, writer: &mut fs::File) -> Result<(), Error> {
+		self.write(writer)
+	}
 }
 
-impl<ChanSigner: ChannelKeys> DiskWriteable for ChannelMonitor<ChanSigner> {
-	fn write(&self, writer: &mut fs::File) -> Result<(), Error> {
-		Writeable::write(self, writer)
+impl<Signer: Sign, M, T, K, F, L> DiskWriteable for ChannelManager<Signer, Arc<M>, Arc<T>, Arc<K>, Arc<F>, Arc<L>>
+where M: chain::Watch<Signer>,
+      T: BroadcasterInterface,
+      K: KeysInterface<Signer=Signer>,
+      F: FeeEstimator,
+      L: Logger,
+{
+	fn write_to_file(&self, writer: &mut fs::File) -> Result<(), std::io::Error> {
+		self.write(writer)
 	}
 }
 
@@ -60,97 +80,80 @@ impl FilesystemPersister {
 		}
 	}
 
-	fn get_full_filepath(&self, funding_txo: OutPoint) -> String {
-		let mut path = PathBuf::from(&self.path_to_channel_data);
-		path.push(format!("{}_{}", funding_txo.txid.to_hex(), funding_txo.index));
-		path.to_str().unwrap().to_string()
+	/// Get the directory which was provided when this persister was initialized.
+	pub fn get_data_dir(&self) -> String {
+		self.path_to_channel_data.clone()
 	}
 
-	// Utility to write a file to disk.
-	fn write_channel_data(&self, funding_txo: OutPoint, monitor: &dyn DiskWriteable) -> std::io::Result<()> {
-		fs::create_dir_all(&self.path_to_channel_data)?;
-		// Do a crazy dance with lots of fsync()s to be overly cautious here...
-		// We never want to end up in a state where we've lost the old data, or end up using the
-		// old data on power loss after we've returned.
-		// The way to atomically write a file on Unix platforms is:
-		// open(tmpname), write(tmpfile), fsync(tmpfile), close(tmpfile), rename(), fsync(dir)
-		let filename = self.get_full_filepath(funding_txo);
-		let tmp_filename = format!("{}.tmp", filename.clone());
+	pub(crate) fn path_to_monitor_data(&self) -> PathBuf {
+		let mut path = PathBuf::from(self.path_to_channel_data.clone());
+		path.push("monitors");
+		path
+	}
 
-		{
-			// Note that going by rust-lang/rust@d602a6b, on MacOS it is only safe to use
-			// rust stdlib 1.36 or higher.
-			let mut f = fs::File::create(&tmp_filename)?;
-			monitor.write(&mut f)?;
-			f.sync_all()?;
-		}
-		fs::rename(&tmp_filename, &filename)?;
-		// Fsync the parent directory on Unix.
-		#[cfg(not(target_os = "windows"))]
-		{
-			let path = Path::new(&filename).parent().unwrap();
-			let dir_file = fs::OpenOptions::new().read(true).open(path)?;
-			unsafe { libc::fsync(dir_file.as_raw_fd()); }
-		}
-		Ok(())
+	/// Writes the provided `ChannelManager` to the path provided at `FilesystemPersister`
+	/// initialization, within a file called "manager".
+	pub fn persist_manager<Signer, M, T, K, F, L>(
+		data_dir: String,
+		manager: &ChannelManager<Signer, Arc<M>, Arc<T>, Arc<K>, Arc<F>, Arc<L>>
+	) -> Result<(), std::io::Error>
+	where Signer: Sign,
+	      M: chain::Watch<Signer>,
+	      T: BroadcasterInterface,
+	      K: KeysInterface<Signer=Signer>,
+	      F: FeeEstimator,
+	      L: Logger
+	{
+		let path = PathBuf::from(data_dir);
+		util::write_to_file(path, "manager".to_string(), manager)
 	}
 
 	#[cfg(test)]
 	fn load_channel_data<Keys: KeysInterface>(&self, keys: &Keys) ->
-		Result<HashMap<OutPoint, ChannelMonitor<Keys::ChanKeySigner>>, ChannelMonitorUpdateErr> {
-		if let Err(_) = fs::create_dir_all(&self.path_to_channel_data) {
-			return Err(ChannelMonitorUpdateErr::PermanentFailure);
-		}
-		let mut res = HashMap::new();
-		for file_option in fs::read_dir(&self.path_to_channel_data).unwrap() {
-			let file = file_option.unwrap();
-			let owned_file_name = file.file_name();
-			let filename = owned_file_name.to_str();
-			if !filename.is_some() || !filename.unwrap().is_ascii() || filename.unwrap().len() < 65 {
+		Result<HashMap<OutPoint, ChannelMonitor<Keys::Signer>>, ChannelMonitorUpdateErr> {
+			if let Err(_) = fs::create_dir_all(self.path_to_monitor_data()) {
 				return Err(ChannelMonitorUpdateErr::PermanentFailure);
 			}
+			let mut res = HashMap::new();
+			for file_option in fs::read_dir(self.path_to_monitor_data()).unwrap() {
+				let file = file_option.unwrap();
+				let owned_file_name = file.file_name();
+				let filename = owned_file_name.to_str();
+				if !filename.is_some() || !filename.unwrap().is_ascii() || filename.unwrap().len() < 65 {
+					return Err(ChannelMonitorUpdateErr::PermanentFailure);
+				}
 
-			let txid = Txid::from_hex(filename.unwrap().split_at(64).0);
-			if txid.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
+				let txid = Txid::from_hex(filename.unwrap().split_at(64).0);
+				if txid.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
 
-			let index = filename.unwrap().split_at(65).1.split('.').next().unwrap().parse();
-			if index.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
+				let index = filename.unwrap().split_at(65).1.split('.').next().unwrap().parse();
+				if index.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
 
-			let contents = fs::read(&file.path());
-			if contents.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
+				let contents = fs::read(&file.path());
+				if contents.is_err() { return Err(ChannelMonitorUpdateErr::PermanentFailure); }
 
-			if let Ok((_, loaded_monitor)) =
-				<(BlockHash, ChannelMonitor<Keys::ChanKeySigner>)>::read(&mut Cursor::new(&contents.unwrap()), keys) {
-				res.insert(OutPoint { txid: txid.unwrap(), index: index.unwrap() }, loaded_monitor);
-			} else {
-				return Err(ChannelMonitorUpdateErr::PermanentFailure);
+				if let Ok((_, loaded_monitor)) =
+					<(BlockHash, ChannelMonitor<Keys::Signer>)>::read(&mut Cursor::new(&contents.unwrap()), keys) {
+						res.insert(OutPoint { txid: txid.unwrap(), index: index.unwrap() }, loaded_monitor);
+					} else {
+						return Err(ChannelMonitorUpdateErr::PermanentFailure);
+					}
 			}
+			Ok(res)
 		}
-		Ok(res)
-	}
 }
 
-impl<ChanSigner: ChannelKeys + Send + Sync> channelmonitor::Persist<ChanSigner> for FilesystemPersister {
-	fn persist_new_channel(&self, funding_txo: OutPoint, monitor: &ChannelMonitor<ChanSigner>) -> Result<(), ChannelMonitorUpdateErr> {
-		self.write_channel_data(funding_txo, monitor)
+impl<ChannelSigner: Sign + Send + Sync> channelmonitor::Persist<ChannelSigner> for FilesystemPersister {
+	fn persist_new_channel(&self, funding_txo: OutPoint, monitor: &ChannelMonitor<ChannelSigner>) -> Result<(), ChannelMonitorUpdateErr> {
+		let filename = format!("{}_{}", funding_txo.txid.to_hex(), funding_txo.index);
+		util::write_to_file(self.path_to_monitor_data(), filename, monitor)
 		  .map_err(|_| ChannelMonitorUpdateErr::PermanentFailure)
 	}
 
-	fn update_persisted_channel(&self, funding_txo: OutPoint, _update: &ChannelMonitorUpdate, monitor: &ChannelMonitor<ChanSigner>) -> Result<(), ChannelMonitorUpdateErr> {
-		self.write_channel_data(funding_txo, monitor)
+	fn update_persisted_channel(&self, funding_txo: OutPoint, _update: &ChannelMonitorUpdate, monitor: &ChannelMonitor<ChannelSigner>) -> Result<(), ChannelMonitorUpdateErr> {
+		let filename = format!("{}_{}", funding_txo.txid.to_hex(), funding_txo.index);
+		util::write_to_file(self.path_to_monitor_data(), filename, monitor)
 		  .map_err(|_| ChannelMonitorUpdateErr::PermanentFailure)
-	}
-}
-
-#[cfg(test)]
-impl Drop for FilesystemPersister {
-	fn drop(&mut self) {
-		// We test for invalid directory names, so it's OK if directory removal
-		// fails.
-		match fs::remove_dir_all(&self.path_to_channel_data) {
-			Err(e) => println!("Failed to remove test persister directory: {}", e),
-			_ => {}
-		}
 	}
 }
 
@@ -162,8 +165,6 @@ mod tests {
 	use bitcoin::blockdata::block::{Block, BlockHeader};
 	use bitcoin::hashes::hex::FromHex;
 	use bitcoin::Txid;
-	use DiskWriteable;
-	use Error;
 	use lightning::chain::channelmonitor::{Persist, ChannelMonitorUpdateErr};
 	use lightning::chain::transaction::OutPoint;
 	use lightning::{check_closed_broadcast, check_added_monitors};
@@ -171,20 +172,22 @@ mod tests {
 	use lightning::ln::functional_test_utils::*;
 	use lightning::ln::msgs::ErrorAction;
 	use lightning::util::events::{MessageSendEventsProvider, MessageSendEvent};
-	use lightning::util::ser::Writer;
 	use lightning::util::test_utils;
 	use std::fs;
-	use std::io;
 	#[cfg(target_os = "windows")]
 	use {
 		lightning::get_event_msg,
 		lightning::ln::msgs::ChannelMessageHandler,
 	};
 
-	struct TestWriteable{}
-	impl DiskWriteable for TestWriteable {
-		fn write(&self, writer: &mut fs::File) -> Result<(), Error> {
-			writer.write_all(&[42; 1])
+	impl Drop for FilesystemPersister {
+		fn drop(&mut self) {
+			// We test for invalid directory names, so it's OK if directory removal
+			// fails.
+			match fs::remove_dir_all(&self.path_to_channel_data) {
+				Err(e) => println!("Failed to remove test persister directory: {}", e),
+				_ => {}
+			}
 		}
 	}
 
@@ -198,8 +201,8 @@ mod tests {
 		let persister_1 = FilesystemPersister::new("test_filesystem_persister_1".to_string());
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let mut node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let chain_mon_0 = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[0].chain_source), &chanmon_cfgs[0].tx_broadcaster, &chanmon_cfgs[0].logger, &chanmon_cfgs[0].fee_estimator, &persister_0);
-		let chain_mon_1 = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[1].chain_source), &chanmon_cfgs[1].tx_broadcaster, &chanmon_cfgs[1].logger, &chanmon_cfgs[1].fee_estimator, &persister_1);
+		let chain_mon_0 = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[0].chain_source), &chanmon_cfgs[0].tx_broadcaster, &chanmon_cfgs[0].logger, &chanmon_cfgs[0].fee_estimator, &persister_0, &node_cfgs[0].keys_manager);
+		let chain_mon_1 = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[1].chain_source), &chanmon_cfgs[1].tx_broadcaster, &chanmon_cfgs[1].logger, &chanmon_cfgs[1].fee_estimator, &persister_1, &node_cfgs[1].keys_manager);
 		node_cfgs[0].chain_monitor = chain_mon_0;
 		node_cfgs[1].chain_monitor = chain_mon_1;
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
@@ -240,102 +243,20 @@ mod tests {
 
 		// Force close because cooperative close doesn't result in any persisted
 		// updates.
-		nodes[0].node.force_close_channel(&nodes[0].node.list_channels()[0].channel_id);
+		nodes[0].node.force_close_channel(&nodes[0].node.list_channels()[0].channel_id).unwrap();
 		check_closed_broadcast!(nodes[0], false);
 		check_added_monitors!(nodes[0], 1);
 
 		let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
 		assert_eq!(node_txn.len(), 1);
 
-		let header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
-		connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[0].clone()]}, 1);
+		let header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[0].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+		connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[0].clone(), node_txn[0].clone()]});
 		check_closed_broadcast!(nodes[1], false);
 		check_added_monitors!(nodes[1], 1);
 
 		// Make sure everything is persisted as expected after close.
 		check_persisted_data!(11);
-	}
-
-	// Test that if the persister's path to channel data is read-only, writing
-	// data to it fails. Windows ignores the read-only flag for folders, so this
-	// test is Unix-only.
-	#[cfg(not(target_os = "windows"))]
-	#[test]
-	fn test_readonly_dir() {
-		let persister = FilesystemPersister::new("test_readonly_dir_persister".to_string());
-		let test_writeable = TestWriteable{};
-		let test_txo = OutPoint {
-			txid: Txid::from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(),
-			index: 0
-		};
-		// Create the persister's directory and set it to read-only.
-		let path = &persister.path_to_channel_data;
-		fs::create_dir_all(path).unwrap();
-		let mut perms = fs::metadata(path).unwrap().permissions();
-		perms.set_readonly(true);
-		fs::set_permissions(path, perms).unwrap();
-		match persister.write_channel_data(test_txo, &test_writeable) {
-			Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
-			_ => panic!("Unexpected error message")
-		}
-	}
-
-	// Test failure to rename in the process of atomically creating a channel
-	// monitor's file. We induce this failure by making the `tmp` file a
-	// directory.
-	// Explanation: given "from" = the file being renamed, "to" = the
-	// renamee that already exists: Windows should fail because it'll fail
-	// whenever "to" is a directory, and Unix should fail because if "from" is a
-	// file, then "to" is also required to be a file.
-	#[test]
-	fn test_rename_failure() {
-		let persister = FilesystemPersister::new("test_rename_failure".to_string());
-		let test_writeable = TestWriteable{};
-		let txid_hex = "8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be";
-		let outp_idx = 0;
-		let test_txo = OutPoint {
-			txid: Txid::from_hex(txid_hex).unwrap(),
-			index: outp_idx,
-		};
-		// Create the channel data file and make it a directory.
-		let path = &persister.path_to_channel_data;
-		fs::create_dir_all(format!("{}/{}_{}", path, txid_hex, outp_idx)).unwrap();
-		match persister.write_channel_data(test_txo, &test_writeable) {
-			Err(e) => {
-				#[cfg(not(target_os = "windows"))]
-				assert_eq!(e.kind(), io::ErrorKind::Other);
-				#[cfg(target_os = "windows")]
-				assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-			}
-			_ => panic!("Unexpected error message")
-		}
-	}
-
-	// Test failure to create the temporary file in the persistence process.
-	// We induce this failure by having the temp file already exist and be a
-	// directory.
-	#[test]
-	fn test_tmp_file_creation_failure() {
-		let persister = FilesystemPersister::new("test_tmp_file_creation_failure".to_string());
-		let test_writeable = TestWriteable{};
-		let txid_hex = "8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be";
-		let outp_idx = 0;
-		let test_txo = OutPoint {
-			txid: Txid::from_hex(txid_hex).unwrap(),
-			index: outp_idx,
-		};
-		// Create the tmp file and make it a directory.
-		let path = &persister.path_to_channel_data;
-		fs::create_dir_all(format!("{}/{}_{}.tmp", path, txid_hex, outp_idx)).unwrap();
-		match persister.write_channel_data(test_txo, &test_writeable) {
-			Err(e) => {
-				#[cfg(not(target_os = "windows"))]
-				assert_eq!(e.kind(), io::ErrorKind::Other);
-				#[cfg(target_os = "windows")]
-				assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-			}
-			_ => panic!("Unexpected error message")
-		}
 	}
 
 	// Test that if the persister's path to channel data is read-only, writing a
@@ -354,7 +275,7 @@ mod tests {
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let chan = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
-		nodes[1].node.force_close_channel(&chan.2);
+		nodes[1].node.force_close_channel(&chan.2).unwrap();
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 
 		// Set the persister's directory to read-only, which should result in
@@ -390,7 +311,7 @@ mod tests {
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let chan = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
-		nodes[1].node.force_close_channel(&chan.2);
+		nodes[1].node.force_close_channel(&chan.2).unwrap();
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 
 		// Create the persister with an invalid directory name and test that the
@@ -410,5 +331,17 @@ mod tests {
 
 		nodes[1].node.get_and_clear_pending_msg_events();
 		added_monitors.clear();
+	}
+}
+
+#[cfg(all(test, feature = "unstable"))]
+pub mod bench {
+	use test::Bencher;
+
+	#[bench]
+	fn bench_sends(bench: &mut Bencher) {
+		let persister_a = super::FilesystemPersister::new("bench_filesystem_persister_a".to_string());
+		let persister_b = super::FilesystemPersister::new("bench_filesystem_persister_b".to_string());
+		lightning::ln::channelmanager::bench::bench_two_sends(bench, persister_a, persister_b);
 	}
 }

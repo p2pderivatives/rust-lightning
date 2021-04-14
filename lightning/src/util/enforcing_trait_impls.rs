@@ -9,7 +9,7 @@
 
 use ln::chan_utils::{HTLCOutputInCommitment, ChannelPublicKeys, HolderCommitmentTransaction, CommitmentTransaction, ChannelTransactionParameters, TrustedCommitmentTransaction};
 use ln::{chan_utils, msgs};
-use chain::keysinterface::{ChannelKeys, InMemoryChannelKeys};
+use chain::keysinterface::{Sign, InMemorySigner};
 
 use std::cmp;
 use std::sync::{Mutex, Arc};
@@ -24,37 +24,72 @@ use util::ser::{Writeable, Writer, Readable};
 use std::io::Error;
 use ln::msgs::DecodeError;
 
-/// An implementation of ChannelKeys that enforces some policy checks.
+/// Initial value for revoked commitment downward counter
+pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
+
+/// An implementation of Sign that enforces some policy checks.  The current checks
+/// are an incomplete set.  They include:
+///
+/// - When signing, the holder transaction has not been revoked
+/// - When revoking, the holder transaction has not been signed
+/// - The holder commitment number is monotonic and without gaps
+/// - The counterparty commitment number is monotonic and without gaps
+/// - The pre-derived keys and pre-built transaction in CommitmentTransaction were correctly built
 ///
 /// Eventually we will probably want to expose a variant of this which would essentially
 /// be what you'd want to run on a hardware wallet.
 #[derive(Clone)]
-pub struct EnforcingChannelKeys {
-	pub inner: InMemoryChannelKeys,
-	last_commitment_number: Arc<Mutex<Option<u64>>>,
+pub struct EnforcingSigner {
+	pub inner: InMemorySigner,
+	/// The last counterparty commitment number we signed, backwards counting
+	pub last_commitment_number: Arc<Mutex<Option<u64>>>,
+	/// The last holder commitment number we revoked, backwards counting
+	pub revoked_commitment: Arc<Mutex<u64>>,
+	pub disable_revocation_policy_check: bool,
 }
 
-impl EnforcingChannelKeys {
-	pub fn new(inner: InMemoryChannelKeys) -> Self {
+impl EnforcingSigner {
+	/// Construct an EnforcingSigner
+	pub fn new(inner: InMemorySigner) -> Self {
 		Self {
 			inner,
 			last_commitment_number: Arc::new(Mutex::new(None)),
+			revoked_commitment: Arc::new(Mutex::new(INITIAL_REVOKED_COMMITMENT_NUMBER)),
+			disable_revocation_policy_check: false
+		}
+	}
+
+	/// Construct an EnforcingSigner with externally managed storage
+	///
+	/// Since there are multiple copies of this struct for each channel, some coordination is needed
+	/// so that all copies are aware of revocations.  A pointer to this state is provided here, usually
+	/// by an implementation of KeysInterface.
+	pub fn new_with_revoked(inner: InMemorySigner, revoked_commitment: Arc<Mutex<u64>>, disable_revocation_policy_check: bool) -> Self {
+		Self {
+			inner,
+			last_commitment_number: Arc::new(Mutex::new(None)),
+			revoked_commitment,
+			disable_revocation_policy_check
 		}
 	}
 }
 
-impl ChannelKeys for EnforcingChannelKeys {
+impl Sign for EnforcingSigner {
 	fn get_per_commitment_point<T: secp256k1::Signing + secp256k1::Verification>(&self, idx: u64, secp_ctx: &Secp256k1<T>) -> PublicKey {
 		self.inner.get_per_commitment_point(idx, secp_ctx)
 	}
 
 	fn release_commitment_secret(&self, idx: u64) -> [u8; 32] {
-		// TODO: enforce the ChannelKeys contract - error here if we already signed this commitment
+		{
+			let mut revoked = self.revoked_commitment.lock().unwrap();
+			assert!(idx == *revoked || idx == *revoked - 1, "can only revoke the current or next unrevoked commitment - trying {}, revoked {}", idx, *revoked);
+			*revoked = idx;
+		}
 		self.inner.release_commitment_secret(idx)
 	}
 
 	fn pubkeys(&self) -> &ChannelPublicKeys { self.inner.pubkeys() }
-	fn key_derivation_params(&self) -> (u64, u64) { self.inner.key_derivation_params() }
+	fn channel_keys_id(&self) -> [u8; 32] { self.inner.channel_keys_id() }
 
 	fn sign_counterparty_commitment<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &CommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<(Signature, Vec<Signature>), ()> {
 		self.verify_counterparty_commitment_tx(commitment_tx, secp_ctx);
@@ -72,23 +107,19 @@ impl ChannelKeys for EnforcingChannelKeys {
 		Ok(self.inner.sign_counterparty_commitment(commitment_tx, secp_ctx).unwrap())
 	}
 
-	fn sign_holder_commitment<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<Signature, ()> {
-		self.verify_holder_commitment_tx(commitment_tx, secp_ctx);
-
-		// TODO: enforce the ChannelKeys contract - error if this commitment was already revoked
-		// TODO: need the commitment number
-		Ok(self.inner.sign_holder_commitment(commitment_tx, secp_ctx).unwrap())
-	}
-
-	#[cfg(any(test,feature = "unsafe_revoked_tx_signing"))]
-	fn unsafe_sign_holder_commitment<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<Signature, ()> {
-		Ok(self.inner.unsafe_sign_holder_commitment(commitment_tx, secp_ctx).unwrap())
-	}
-
-	fn sign_holder_commitment_htlc_transactions<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<Vec<Signature>, ()> {
+	fn sign_holder_commitment_and_htlcs<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<(Signature, Vec<Signature>), ()> {
 		let trusted_tx = self.verify_holder_commitment_tx(commitment_tx, secp_ctx);
 		let commitment_txid = trusted_tx.txid();
 		let holder_csv = self.inner.counterparty_selected_contest_delay();
+
+		let revoked = self.revoked_commitment.lock().unwrap();
+		let commitment_number = trusted_tx.commitment_number();
+		if *revoked - 1 != commitment_number && *revoked - 2 != commitment_number {
+			if !self.disable_revocation_policy_check {
+				panic!("can only sign the next two unrevoked commitment numbers, revoked={} vs requested={} for {}",
+				       *revoked, commitment_number, self.inner.commitment_seed[0])
+			}
+		}
 
 		for (this_htlc, sig) in trusted_tx.htlcs().iter().zip(&commitment_tx.counterparty_htlc_sigs) {
 			assert!(this_htlc.transaction_output_index.is_some());
@@ -101,7 +132,12 @@ impl ChannelKeys for EnforcingChannelKeys {
 			secp_ctx.verify(&sighash, sig, &keys.countersignatory_htlc_key).unwrap();
 		}
 
-		Ok(self.inner.sign_holder_commitment_htlc_transactions(commitment_tx, secp_ctx).unwrap())
+		Ok(self.inner.sign_holder_commitment_and_htlcs(commitment_tx, secp_ctx).unwrap())
+	}
+
+	#[cfg(any(test,feature = "unsafe_revoked_tx_signing"))]
+	fn unsafe_sign_holder_commitment_and_htlcs<T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<T>) -> Result<(Signature, Vec<Signature>), ()> {
+		Ok(self.inner.unsafe_sign_holder_commitment_and_htlcs(commitment_tx, secp_ctx).unwrap())
 	}
 
 	fn sign_justice_transaction<T: secp256k1::Signing + secp256k1::Verification>(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, htlc: &Option<HTLCOutputInCommitment>, secp_ctx: &Secp256k1<T>) -> Result<Signature, ()> {
@@ -126,7 +162,7 @@ impl ChannelKeys for EnforcingChannelKeys {
 }
 
 
-impl Writeable for EnforcingChannelKeys {
+impl Writeable for EnforcingSigner {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		self.inner.write(writer)?;
 		let last = *self.last_commitment_number.lock().unwrap();
@@ -135,18 +171,20 @@ impl Writeable for EnforcingChannelKeys {
 	}
 }
 
-impl Readable for EnforcingChannelKeys {
+impl Readable for EnforcingSigner {
 	fn read<R: ::std::io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
 		let inner = Readable::read(reader)?;
 		let last_commitment_number = Readable::read(reader)?;
-		Ok(EnforcingChannelKeys {
+		Ok(EnforcingSigner {
 			inner,
-			last_commitment_number: Arc::new(Mutex::new(last_commitment_number))
+			last_commitment_number: Arc::new(Mutex::new(last_commitment_number)),
+			revoked_commitment: Arc::new(Mutex::new(INITIAL_REVOKED_COMMITMENT_NUMBER)),
+			disable_revocation_policy_check: false,
 		})
 	}
 }
 
-impl EnforcingChannelKeys {
+impl EnforcingSigner {
 	fn verify_counterparty_commitment_tx<'a, T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &'a CommitmentTransaction, secp_ctx: &Secp256k1<T>) -> TrustedCommitmentTransaction<'a> {
 		commitment_tx.verify(&self.inner.get_channel_parameters().as_counterparty_broadcastable(),
 		                     self.inner.counterparty_pubkeys(), self.inner.pubkeys(), secp_ctx)

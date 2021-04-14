@@ -72,7 +72,7 @@ impl<'a, T> std::fmt::Display for DebugFundingInfo<'a, T> {
 }
 macro_rules! log_funding_info {
 	($key_storage: expr) => {
-		::util::macro_logger::DebugFundingInfo($key_storage.get_funding_txo())
+		::util::macro_logger::DebugFundingInfo(&$key_storage.get_funding_txo())
 	}
 }
 
@@ -138,11 +138,11 @@ impl<'a> std::fmt::Display for DebugSpendable<'a> {
 			&SpendableOutputDescriptor::StaticOutput { ref outpoint, .. } => {
 				write!(f, "StaticOutput {}:{} marked for spending", outpoint.txid, outpoint.index)?;
 			}
-			&SpendableOutputDescriptor::DynamicOutputP2WSH { ref outpoint, .. } => {
-				write!(f, "DynamicOutputP2WSH {}:{} marked for spending", outpoint.txid, outpoint.index)?;
+			&SpendableOutputDescriptor::DelayedPaymentOutput(ref descriptor) => {
+				write!(f, "DelayedPaymentOutput {}:{} marked for spending", descriptor.outpoint.txid, descriptor.outpoint.index)?;
 			}
-			&SpendableOutputDescriptor::StaticOutputCounterpartyPayment { ref outpoint, .. } => {
-				write!(f, "DynamicOutputP2WPKH {}:{} marked for spending", outpoint.txid, outpoint.index)?;
+			&SpendableOutputDescriptor::StaticPaymentOutput(ref descriptor) => {
+				write!(f, "DynamicOutputP2WPKH {}:{} marked for spending", descriptor.outpoint.txid, descriptor.outpoint.index)?;
 			}
 		}
 		Ok(())
@@ -155,12 +155,17 @@ macro_rules! log_spendable {
 	}
 }
 
+/// Create a new Record and log it. You probably don't want to use this macro directly,
+/// but it needs to be exported so `log_trace` etc can use it in external crates.
+#[macro_export]
 macro_rules! log_internal {
 	($logger: expr, $lvl:expr, $($arg:tt)+) => (
-		$logger.log(&::util::logger::Record::new($lvl, format_args!($($arg)+), module_path!(), file!(), line!()));
+		$logger.log(&$crate::util::logger::Record::new($lvl, format_args!($($arg)+), module_path!(), file!(), line!()));
 	);
 }
 
+/// Log an error.
+#[macro_export]
 macro_rules! log_error {
 	($logger: expr, $($arg:tt)*) => (
 		#[cfg(not(any(feature = "max_level_off")))]
@@ -189,6 +194,8 @@ macro_rules! log_debug {
 	)
 }
 
+/// Log a trace log.
+#[macro_export]
 macro_rules! log_trace {
 	($logger: expr, $($arg:tt)*) => (
 		#[cfg(not(any(feature = "max_level_off", feature = "max_level_error", feature = "max_level_warn", feature = "max_level_info", feature = "max_level_debug")))]

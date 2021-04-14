@@ -33,9 +33,10 @@ use bitcoin::hash_types::{Txid, BlockHash};
 use ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 
 use std::{cmp, fmt};
+use std::fmt::Debug;
 use std::io::Read;
 
-use util::events;
+use util::events::MessageSendEventsProvider;
 use util::ser::{Readable, Writeable, Writer, FixedLengthReader, HighZeroBytesDroppedVarInt};
 
 use ln::channelmanager::{PaymentPreimage, PaymentHash, PaymentSecret};
@@ -44,7 +45,7 @@ use ln::channelmanager::{PaymentPreimage, PaymentHash, PaymentSecret};
 pub(crate) const MAX_VALUE_MSAT: u64 = 21_000_000_0000_0000_000;
 
 /// An error in decoding a message or struct.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum DecodeError {
 	/// A version byte specified something we don't know how to handle.
 	/// Includes unknown realm byte in an OnionHopData packet
@@ -60,20 +61,19 @@ pub enum DecodeError {
 	/// A length descriptor in the packet didn't describe the later data correctly
 	BadLengthDescriptor,
 	/// Error from std::io
-	Io(::std::io::Error),
+	Io(/// (C-not exported) as ErrorKind doesn't have a reasonable mapping
+        ::std::io::ErrorKind),
 }
 
 /// An init message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Init {
-	#[cfg(not(feature = "fuzztarget"))]
-	pub(crate) features: InitFeatures,
-	#[cfg(feature = "fuzztarget")]
+	/// The relevant features which the sender supports
 	pub features: InitFeatures,
 }
 
 /// An error message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ErrorMessage {
 	/// The channel ID involved in the error
 	pub channel_id: [u8; 32],
@@ -85,7 +85,7 @@ pub struct ErrorMessage {
 }
 
 /// A ping message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ping {
 	/// The desired response length
 	pub ponglen: u16,
@@ -95,7 +95,7 @@ pub struct Ping {
 }
 
 /// A pong message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pong {
 	/// The pong packet size.
 	/// This field is not sent on the wire. byteslen zeros are sent.
@@ -103,7 +103,7 @@ pub struct Pong {
 }
 
 /// An open_channel message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OpenChannel {
 	/// The genesis hash of the blockchain where the channel is to be opened
 	pub chain_hash: BlockHash,
@@ -146,7 +146,7 @@ pub struct OpenChannel {
 }
 
 /// An accept_channel message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AcceptChannel {
 	/// A temporary channel ID, until the funding outpoint is announced
 	pub temporary_channel_id: [u8; 32],
@@ -181,7 +181,7 @@ pub struct AcceptChannel {
 }
 
 /// A funding_created message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FundingCreated {
 	/// A temporary channel ID, until the funding is established
 	pub temporary_channel_id: [u8; 32],
@@ -194,7 +194,7 @@ pub struct FundingCreated {
 }
 
 /// A funding_signed message to be sent or received from a peer
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FundingSigned {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -203,7 +203,7 @@ pub struct FundingSigned {
 }
 
 /// A funding_locked message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FundingLocked {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -212,7 +212,7 @@ pub struct FundingLocked {
 }
 
 /// A shutdown message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Shutdown {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -222,7 +222,7 @@ pub struct Shutdown {
 }
 
 /// A closing_signed message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClosingSigned {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -233,7 +233,7 @@ pub struct ClosingSigned {
 }
 
 /// An update_add_htlc message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateAddHTLC {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -249,7 +249,7 @@ pub struct UpdateAddHTLC {
 }
 
 /// An update_fulfill_htlc message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateFulfillHTLC {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -260,7 +260,7 @@ pub struct UpdateFulfillHTLC {
 }
 
 /// An update_fail_htlc message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateFailHTLC {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -270,7 +270,7 @@ pub struct UpdateFailHTLC {
 }
 
 /// An update_fail_malformed_htlc message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateFailMalformedHTLC {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -282,7 +282,7 @@ pub struct UpdateFailMalformedHTLC {
 }
 
 /// A commitment_signed message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommitmentSigned {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -293,7 +293,7 @@ pub struct CommitmentSigned {
 }
 
 /// A revoke_and_ack message to be sent or received from a peer
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RevokeAndACK {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -304,7 +304,7 @@ pub struct RevokeAndACK {
 }
 
 /// An update_fee message to be sent or received from a peer
-#[derive(PartialEq, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateFee {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -312,7 +312,7 @@ pub struct UpdateFee {
 	pub feerate_per_kw: u32,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 /// Proof that the sender knows the per-commitment secret of the previous commitment transaction.
 /// This is used to convince the recipient that the channel is at a certain commitment
 /// number even if they lost that data due to a local failure.  Of course, the peer may lie
@@ -326,7 +326,7 @@ pub struct DataLossProtect {
 }
 
 /// A channel_reestablish message to be sent or received from a peer
-#[derive(PartialEq, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelReestablish {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -339,7 +339,7 @@ pub struct ChannelReestablish {
 }
 
 /// An announcement_signatures message to be sent or received from a peer
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AnnouncementSignatures {
 	/// The channel ID
 	pub channel_id: [u8; 32],
@@ -352,7 +352,7 @@ pub struct AnnouncementSignatures {
 }
 
 /// An address which can be used to connect to a remote peer
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NetAddress {
 	/// An IPv4 address/port on which the peer is listening.
 	IPv4 {
@@ -390,15 +390,6 @@ pub enum NetAddress {
 	},
 }
 impl NetAddress {
-	fn get_id(&self) -> u8 {
-		match self {
-			&NetAddress::IPv4 {..} => { 1 },
-			&NetAddress::IPv6 {..} => { 2 },
-			&NetAddress::OnionV2 {..} => { 3 },
-			&NetAddress::OnionV3 {..} => { 4 },
-		}
-	}
-
 	/// Strict byte-length of address descriptor, 1-byte type not recorded
 	fn len(&self) -> u16 {
 		match self {
@@ -479,7 +470,7 @@ impl Readable for Result<NetAddress, u8> {
 }
 
 /// The unsigned part of a node_announcement
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UnsignedNodeAnnouncement {
 	/// The advertised features
 	pub features: NodeFeatures,
@@ -498,7 +489,7 @@ pub struct UnsignedNodeAnnouncement {
 	pub(crate) excess_address_data: Vec<u8>,
 	pub(crate) excess_data: Vec<u8>,
 }
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 /// A node_announcement message to be sent or received from a peer
 pub struct NodeAnnouncement {
 	/// The signature by the node key
@@ -508,7 +499,7 @@ pub struct NodeAnnouncement {
 }
 
 /// The unsigned part of a channel_announcement
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UnsignedChannelAnnouncement {
 	/// The advertised channel features
 	pub features: ChannelFeatures,
@@ -527,7 +518,7 @@ pub struct UnsignedChannelAnnouncement {
 	pub(crate) excess_data: Vec<u8>,
 }
 /// A channel_announcement message to be sent or received from a peer
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelAnnouncement {
 	/// Authentication of the announcement by the first public node
 	pub node_signature_1: Signature,
@@ -542,7 +533,7 @@ pub struct ChannelAnnouncement {
 }
 
 /// The unsigned part of a channel_update
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UnsignedChannelUpdate {
 	/// The genesis hash of the blockchain where the channel is to be opened
 	pub chain_hash: BlockHash,
@@ -552,7 +543,14 @@ pub struct UnsignedChannelUpdate {
 	pub timestamp: u32,
 	/// Channel flags
 	pub flags: u8,
-	/// The number of blocks to subtract from incoming HTLC cltv_expiry values
+	/// The number of blocks such that if:
+	/// `incoming_htlc.cltv_expiry < outgoing_htlc.cltv_expiry + cltv_expiry_delta`
+	/// then we need to fail the HTLC backwards. When forwarding an HTLC, cltv_expiry_delta determines
+	/// the outgoing HTLC's minimum cltv_expiry value -- so, if an incoming HTLC comes in with a
+	/// cltv_expiry of 100000, and the node we're forwarding to has a cltv_expiry_delta value of 10,
+	/// then we'll check that the outgoing HTLC's cltv_expiry value is at least 100010 before
+	/// forwarding. Note that the HTLC sender is the one who originally sets this value when
+	/// constructing the route.
 	pub cltv_expiry_delta: u16,
 	/// The minimum HTLC size incoming to sender, in milli-satoshi
 	pub htlc_minimum_msat: u64,
@@ -565,7 +563,7 @@ pub struct UnsignedChannelUpdate {
 	pub(crate) excess_data: Vec<u8>,
 }
 /// A channel_update message to be sent or received from a peer
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelUpdate {
 	/// A signature of the channel update
 	pub signature: Signature,
@@ -577,7 +575,7 @@ pub struct ChannelUpdate {
 /// UTXOs in a range of blocks. The recipient of a query makes a best
 /// effort to reply to the query using one or more reply_channel_range
 /// messages.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct QueryChannelRange {
 	/// The genesis hash of the blockchain being queried
 	pub chain_hash: BlockHash,
@@ -594,7 +592,7 @@ pub struct QueryChannelRange {
 /// not be a perfect view of the network. The short_channel_ids in the
 /// reply are encoded. We only support encoding_type=0 uncompressed
 /// serialization and do not support encoding_type=1 zlib serialization.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplyChannelRange {
 	/// The genesis hash of the blockchain being queried
 	pub chain_hash: BlockHash,
@@ -602,9 +600,8 @@ pub struct ReplyChannelRange {
 	pub first_blocknum: u32,
 	/// The number of blocks included in the range of the reply
 	pub number_of_blocks: u32,
-	/// Indicates if the query recipient maintains up-to-date channel
-	/// information for the chain_hash
-	pub full_information: bool,
+	/// True when this is the final reply for a query
+	pub sync_complete: bool,
 	/// The short_channel_ids in the channel range
 	pub short_channel_ids: Vec<u64>,
 }
@@ -617,7 +614,7 @@ pub struct ReplyChannelRange {
 /// reply_short_channel_ids_end message. The short_channel_ids sent in
 /// this query are encoded. We only support encoding_type=0 uncompressed
 /// serialization and do not support encoding_type=1 zlib serialization.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct QueryShortChannelIds {
 	/// The genesis hash of the blockchain being queried
 	pub chain_hash: BlockHash,
@@ -629,7 +626,7 @@ pub struct QueryShortChannelIds {
 /// query_short_channel_ids message. The query recipient makes a best
 /// effort to respond based on their local network view which may not be
 /// a perfect view of the network.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplyShortChannelIdsEnd {
 	/// The genesis hash of the blockchain that was queried
 	pub chain_hash: BlockHash,
@@ -641,7 +638,7 @@ pub struct ReplyShortChannelIdsEnd {
 /// A gossip_timestamp_filter message is used by a node to request
 /// gossip relay for messages in the requested time range when the
 /// gossip_queries feature has been negotiated.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GossipTimestampFilter {
 	/// The genesis hash of the blockchain for channel and node information
 	pub chain_hash: BlockHash,
@@ -658,7 +655,7 @@ enum EncodingType {
 }
 
 /// Used to put an error message in a LightningError
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ErrorAction {
 	/// The peer took some action which made us think they were useless. Disconnect them.
 	DisconnectPeer {
@@ -675,6 +672,7 @@ pub enum ErrorAction {
 }
 
 /// An Err type for failure to process messages.
+#[derive(Clone, Debug)]
 pub struct LightningError {
 	/// A human-readable message describing the error
 	pub err: String,
@@ -684,7 +682,7 @@ pub struct LightningError {
 
 /// Struct used to return values from revoke_and_ack messages, containing a bunch of commitment
 /// transaction updates if they were pending.
-#[derive(PartialEq, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommitmentUpdate {
 	/// update_add_htlc messages which should be sent
 	pub update_add_htlcs: Vec<UpdateAddHTLC>,
@@ -703,7 +701,7 @@ pub struct CommitmentUpdate {
 /// The information we received from a peer along the route of a payment we originated. This is
 /// returned by ChannelMessageHandler::handle_update_fail_htlc to be passed into
 /// RoutingMessageHandler::handle_htlc_fail_channel_update to update our network map.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HTLCFailChannelUpdate {
 	/// We received an error which included a full ChannelUpdate message.
 	ChannelUpdateMessage {
@@ -734,7 +732,7 @@ pub enum HTLCFailChannelUpdate {
 /// OptionalFeild simply gets Present if there are enough bytes to read into it), we have a
 /// separate enum type for them.
 /// (C-not exported) due to a free generic in T
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OptionalField<T> {
 	/// Optional field is included in message
 	Present(T),
@@ -746,7 +744,7 @@ pub enum OptionalField<T> {
 ///
 /// Messages MAY be called in parallel when they originate from different their_node_ids, however
 /// they MUST NOT be called in parallel when the two calls have the same their_node_id.
-pub trait ChannelMessageHandler : events::MessageSendEventsProvider + Send + Sync {
+pub trait ChannelMessageHandler : MessageSendEventsProvider + Send + Sync {
 	//Channel init:
 	/// Handle an incoming open_channel message from the given peer.
 	fn handle_open_channel(&self, their_node_id: &PublicKey, their_features: InitFeatures, msg: &OpenChannel);
@@ -761,7 +759,7 @@ pub trait ChannelMessageHandler : events::MessageSendEventsProvider + Send + Syn
 
 	// Channl close:
 	/// Handle an incoming shutdown message from the given peer.
-	fn handle_shutdown(&self, their_node_id: &PublicKey, msg: &Shutdown);
+	fn handle_shutdown(&self, their_node_id: &PublicKey, their_features: &InitFeatures, msg: &Shutdown);
 	/// Handle an incoming closing_signed message from the given peer.
 	fn handle_closing_signed(&self, their_node_id: &PublicKey, msg: &ClosingSigned);
 
@@ -798,6 +796,9 @@ pub trait ChannelMessageHandler : events::MessageSendEventsProvider + Send + Syn
 	/// Handle an incoming channel_reestablish message from the given peer.
 	fn handle_channel_reestablish(&self, their_node_id: &PublicKey, msg: &ChannelReestablish);
 
+	/// Handle an incoming channel update from the given peer.
+	fn handle_channel_update(&self, their_node_id: &PublicKey, msg: &ChannelUpdate);
+
 	// Error:
 	/// Handle an incoming error message from the given peer.
 	fn handle_error(&self, their_node_id: &PublicKey, msg: &ErrorMessage);
@@ -810,7 +811,7 @@ pub trait ChannelMessageHandler : events::MessageSendEventsProvider + Send + Syn
 /// For `gossip_queries` messages there are potential DoS vectors when handling
 /// inbound queries. Implementors using an on-disk network graph should be aware of
 /// repeated disk I/O for queries accessing different parts of the network graph.
-pub trait RoutingMessageHandler : Send + Sync + events::MessageSendEventsProvider {
+pub trait RoutingMessageHandler : Send + Sync + MessageSendEventsProvider {
 	/// Handle an incoming node_announcement message, returning true if it should be forwarded on,
 	/// false or returning an Err otherwise.
 	fn handle_node_announcement(&self, msg: &NodeAnnouncement) -> Result<bool, LightningError>;
@@ -919,7 +920,13 @@ impl PartialEq for OnionPacket {
 	}
 }
 
-#[derive(Clone, PartialEq)]
+impl fmt::Debug for OnionPacket {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.write_fmt(format_args!("OnionPacket version {} with hmac {:?}", self.version, &self.hmac[..]))
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OnionErrorPacket {
 	// This really should be a constant size slice, but the spec lets these things be up to 128KB?
 	// (TODO) We limit it in decode to much lower...
@@ -939,18 +946,12 @@ impl fmt::Display for DecodeError {
 	}
 }
 
-impl fmt::Debug for LightningError {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str(self.err.as_str())
-	}
-}
-
 impl From<::std::io::Error> for DecodeError {
 	fn from(e: ::std::io::Error) -> Self {
 		if e.kind() == ::std::io::ErrorKind::UnexpectedEof {
 			DecodeError::ShortRead
 		} else {
-			DecodeError::Io(e)
+			DecodeError::Io(e.kind())
 		}
 	}
 }
@@ -1534,14 +1535,12 @@ impl Writeable for UnsignedNodeAnnouncement {
 		w.write_all(&self.rgb)?;
 		self.alias.write(w)?;
 
-		let mut addrs_to_encode = self.addresses.clone();
-		addrs_to_encode.sort_by(|a, b| { a.get_id().cmp(&b.get_id()) });
 		let mut addr_len = 0;
-		for addr in &addrs_to_encode {
+		for addr in self.addresses.iter() {
 			addr_len += 1 + addr.len();
 		}
 		(addr_len + self.excess_address_data.len() as u16).write(w)?;
-		for addr in addrs_to_encode {
+		for addr in self.addresses.iter() {
 			addr.write(w)?;
 		}
 		w.write_all(&self.excess_address_data[..])?;
@@ -1561,7 +1560,6 @@ impl Readable for UnsignedNodeAnnouncement {
 
 		let addr_len: u16 = Readable::read(r)?;
 		let mut addresses: Vec<NetAddress> = Vec::new();
-		let mut highest_addr_type = 0;
 		let mut addr_readpos = 0;
 		let mut excess = false;
 		let mut excess_byte = 0;
@@ -1569,11 +1567,6 @@ impl Readable for UnsignedNodeAnnouncement {
 			if addr_len <= addr_readpos { break; }
 			match Readable::read(r) {
 				Ok(Ok(addr)) => {
-					if addr.get_id() < highest_addr_type {
-						// Addresses must be sorted in increasing order
-						return Err(DecodeError::InvalidValue);
-					}
-					highest_addr_type = addr.get_id();
 					if addr_len < addr_readpos + 1 + addr.len() {
 						return Err(DecodeError::BadLengthDescriptor);
 					}
@@ -1699,6 +1692,19 @@ impl Writeable for ReplyShortChannelIdsEnd {
 	}
 }
 
+impl QueryChannelRange {
+	/**
+	 * Calculates the overflow safe ending block height for the query.
+	 * Overflow returns `0xffffffff`, otherwise returns `first_blocknum + number_of_blocks`
+	 */
+	pub fn end_blocknum(&self) -> u32 {
+		match self.first_blocknum.checked_add(self.number_of_blocks) {
+			Some(block) => block,
+			None => u32::max_value(),
+		}
+	}
+}
+
 impl Readable for QueryChannelRange {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let chain_hash: BlockHash = Readable::read(r)?;
@@ -1727,7 +1733,7 @@ impl Readable for ReplyChannelRange {
 		let chain_hash: BlockHash = Readable::read(r)?;
 		let first_blocknum: u32 = Readable::read(r)?;
 		let number_of_blocks: u32 = Readable::read(r)?;
-		let full_information: bool = Readable::read(r)?;
+		let sync_complete: bool = Readable::read(r)?;
 
 		// We expect the encoding_len to always includes the 1-byte
 		// encoding_type and that short_channel_ids are 8-bytes each
@@ -1755,7 +1761,7 @@ impl Readable for ReplyChannelRange {
 			chain_hash,
 			first_blocknum,
 			number_of_blocks,
-			full_information,
+			sync_complete,
 			short_channel_ids
 		})
 	}
@@ -1768,7 +1774,7 @@ impl Writeable for ReplyChannelRange {
 		self.chain_hash.write(w)?;
 		self.first_blocknum.write(w)?;
 		self.number_of_blocks.write(w)?;
-		self.full_information.write(w)?;
+		self.sync_complete.write(w)?;
 
 		encoding_len.write(w)?;
 		(EncodingType::Uncompressed as u8).write(w)?;
@@ -2541,6 +2547,24 @@ mod tests {
 	}
 
 	#[test]
+	fn query_channel_range_end_blocknum() {
+		let tests: Vec<(u32, u32, u32)> = vec![
+			(10000, 1500, 11500),
+			(0, 0xffffffff, 0xffffffff),
+			(1, 0xffffffff, 0xffffffff),
+		];
+
+		for (first_blocknum, number_of_blocks, expected) in tests.into_iter() {
+			let sut = msgs::QueryChannelRange {
+				chain_hash: BlockHash::from_hex("06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f").unwrap(),
+				first_blocknum,
+				number_of_blocks,
+			};
+			assert_eq!(sut.end_blocknum(), expected);
+		}
+	}
+
+	#[test]
 	fn encoding_query_channel_range() {
 		let mut query_channel_range = msgs::QueryChannelRange {
 			chain_hash: BlockHash::from_hex("06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f").unwrap(),
@@ -2569,7 +2593,7 @@ mod tests {
 			chain_hash: expected_chain_hash,
 			first_blocknum: 756230,
 			number_of_blocks: 1500,
-			full_information: true,
+			sync_complete: true,
 			short_channel_ids: vec![0x000000000000008e, 0x0000000000003c69, 0x000000000045a6c4],
 		};
 
@@ -2582,7 +2606,7 @@ mod tests {
 			assert_eq!(reply_channel_range.chain_hash, expected_chain_hash);
 			assert_eq!(reply_channel_range.first_blocknum, 756230);
 			assert_eq!(reply_channel_range.number_of_blocks, 1500);
-			assert_eq!(reply_channel_range.full_information, true);
+			assert_eq!(reply_channel_range.sync_complete, true);
 			assert_eq!(reply_channel_range.short_channel_ids[0], 0x000000000000008e);
 			assert_eq!(reply_channel_range.short_channel_ids[1], 0x0000000000003c69);
 			assert_eq!(reply_channel_range.short_channel_ids[2], 0x000000000045a6c4);

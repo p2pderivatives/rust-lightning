@@ -13,21 +13,22 @@
 use chain::Watch;
 use chain::channelmonitor::ChannelMonitor;
 use chain::transaction::OutPoint;
-use ln::channelmanager::{ChannelManager, ChannelManagerReadArgs, RAACommitmentOrder, PaymentPreimage, PaymentHash, PaymentSecret, PaymentSendFailure};
+use ln::channelmanager::{ChainParameters, ChannelManager, ChannelManagerReadArgs, RAACommitmentOrder, PaymentPreimage, PaymentHash, PaymentSecret, PaymentSendFailure};
 use routing::router::{Route, get_route};
 use routing::network_graph::{NetGraphMsgHandler, NetworkGraph};
 use ln::features::InitFeatures;
 use ln::msgs;
 use ln::msgs::{ChannelMessageHandler,RoutingMessageHandler};
-use util::enforcing_trait_impls::EnforcingChannelKeys;
+use util::enforcing_trait_impls::EnforcingSigner;
 use util::test_utils;
-use util::test_utils::{TestChainMonitor, OnlyReadsKeysInterface};
+use util::test_utils::TestChainMonitor;
 use util::events::{Event, EventsProvider, MessageSendEvent, MessageSendEventsProvider};
 use util::errors::APIError;
 use util::config::UserConfig;
 use util::ser::{ReadableArgs, Writeable, Readable};
 
 use bitcoin::blockdata::block::{Block, BlockHeader};
+use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::transaction::{Transaction, TxOut};
 use bitcoin::network::constants::Network;
 
@@ -43,51 +44,81 @@ use std::sync::Mutex;
 use std::mem;
 use std::collections::HashMap;
 
-pub const CHAN_CONFIRM_DEPTH: u32 = 100;
+pub const CHAN_CONFIRM_DEPTH: u32 = 10;
 
+/// Mine the given transaction in the next block and then mine CHAN_CONFIRM_DEPTH - 1 blocks on
+/// top, giving the given transaction CHAN_CONFIRM_DEPTH confirmations.
 pub fn confirm_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction) {
-	let dummy_tx = Transaction { version: 0, lock_time: 0, input: Vec::new(), output: Vec::new() };
-	let dummy_tx_count = tx.version as usize;
+	confirm_transaction_at(node, tx, node.best_block_info().1 + 1);
+	connect_blocks(node, CHAN_CONFIRM_DEPTH - 1);
+}
+/// Mine a signle block containing the given transaction
+pub fn mine_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction) {
+	let height = node.best_block_info().1 + 1;
+	confirm_transaction_at(node, tx, height);
+}
+/// Mine the given transaction at the given height, mining blocks as required to build to that
+/// height
+pub fn confirm_transaction_at<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction, conf_height: u32) {
+	let starting_block = node.best_block_info();
 	let mut block = Block {
-		header: BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
-		txdata: vec![dummy_tx; dummy_tx_count],
+		header: BlockHeader { version: 0x20000000, prev_blockhash: starting_block.0, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+		txdata: Vec::new(),
 	};
-	block.txdata.push(tx.clone());
-	connect_block(node, &block, 1);
-	for i in 2..CHAN_CONFIRM_DEPTH {
+	let height = starting_block.1 + 1;
+	assert!(height <= conf_height);
+	for _ in height..conf_height {
+		connect_block(node, &block);
 		block = Block {
 			header: BlockHeader { version: 0x20000000, prev_blockhash: block.header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 			txdata: vec![],
 		};
-		connect_block(node, &block, i);
 	}
+
+	for _ in 0..*node.network_chan_count.borrow() { // Make sure we don't end up with channels at the same short id by offsetting by chan_count
+		block.txdata.push(Transaction { version: 0, lock_time: 0, input: Vec::new(), output: Vec::new() });
+	}
+	block.txdata.push(tx.clone());
+	connect_block(node, &block);
 }
 
-pub fn connect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, depth: u32, height: u32, parent: bool, prev_blockhash: BlockHash) -> BlockHash {
+pub fn connect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, depth: u32) -> BlockHash {
 	let mut block = Block {
-		header: BlockHeader { version: 0x2000000, prev_blockhash: if parent { prev_blockhash } else { Default::default() }, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+		header: BlockHeader { version: 0x2000000, prev_blockhash: node.best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 		txdata: vec![],
 	};
-	connect_block(node, &block, height + 1);
-	for i in 2..depth + 1 {
+	connect_block(node, &block);
+	for _ in 2..depth + 1 {
 		block = Block {
 			header: BlockHeader { version: 0x20000000, prev_blockhash: block.header.block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
 			txdata: vec![],
 		};
-		connect_block(node, &block, height + i);
+		connect_block(node, &block);
 	}
 	block.header.block_hash()
 }
 
-pub fn connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: &Block, height: u32) {
+pub fn connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: &Block) {
 	let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
+	let height = node.best_block_info().1 + 1;
 	node.chain_monitor.chain_monitor.block_connected(&block.header, &txdata, height);
 	node.node.block_connected(&block.header, &txdata, height);
+	node.node.test_process_background_events();
+	node.blocks.borrow_mut().push((block.header, height));
 }
 
-pub fn disconnect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, header: &BlockHeader, height: u32) {
-	node.chain_monitor.chain_monitor.block_disconnected(header, height);
-	node.node.block_disconnected(header);
+pub fn disconnect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, count: u32) {
+	for _ in 0..count {
+		let orig_header = node.blocks.borrow_mut().pop().unwrap();
+		assert!(orig_header.1 > 0); // Cannot disconnect genesis
+		node.chain_monitor.chain_monitor.block_disconnected(&orig_header.0, orig_header.1);
+		node.node.block_disconnected(&orig_header.0);
+	}
+}
+
+pub fn disconnect_all_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>) {
+	let count = node.blocks.borrow_mut().len() as u32 - 1;
+	disconnect_blocks(node, count);
 }
 
 pub struct TestChanMonCfg {
@@ -96,6 +127,7 @@ pub struct TestChanMonCfg {
 	pub chain_source: test_utils::TestChainSource,
 	pub persister: test_utils::TestPersister,
 	pub logger: test_utils::TestLogger,
+	pub keys_manager: test_utils::TestKeysInterface,
 }
 
 pub struct NodeCfg<'a> {
@@ -103,7 +135,7 @@ pub struct NodeCfg<'a> {
 	pub tx_broadcaster: &'a test_utils::TestBroadcaster,
 	pub fee_estimator: &'a test_utils::TestFeeEstimator,
 	pub chain_monitor: test_utils::TestChainMonitor<'a>,
-	pub keys_manager: test_utils::TestKeysInterface,
+	pub keys_manager: &'a test_utils::TestKeysInterface,
 	pub logger: &'a test_utils::TestLogger,
 	pub node_seed: [u8; 32],
 }
@@ -113,12 +145,21 @@ pub struct Node<'a, 'b: 'a, 'c: 'b> {
 	pub tx_broadcaster: &'c test_utils::TestBroadcaster,
 	pub chain_monitor: &'b test_utils::TestChainMonitor<'c>,
 	pub keys_manager: &'b test_utils::TestKeysInterface,
-	pub node: &'a ChannelManager<EnforcingChannelKeys, &'b TestChainMonitor<'c>, &'c test_utils::TestBroadcaster, &'b test_utils::TestKeysInterface, &'c test_utils::TestFeeEstimator, &'c test_utils::TestLogger>,
+	pub node: &'a ChannelManager<EnforcingSigner, &'b TestChainMonitor<'c>, &'c test_utils::TestBroadcaster, &'b test_utils::TestKeysInterface, &'c test_utils::TestFeeEstimator, &'c test_utils::TestLogger>,
 	pub net_graph_msg_handler: NetGraphMsgHandler<&'c test_utils::TestChainSource, &'c test_utils::TestLogger>,
 	pub node_seed: [u8; 32],
 	pub network_payment_count: Rc<RefCell<u8>>,
 	pub network_chan_count: Rc<RefCell<u32>>,
 	pub logger: &'c test_utils::TestLogger,
+	pub blocks: RefCell<Vec<(BlockHeader, u32)>>,
+}
+impl<'a, 'b, 'c> Node<'a, 'b, 'c> {
+	pub fn best_block_hash(&self) -> BlockHash {
+		self.blocks.borrow_mut().last().unwrap().0.block_hash()
+	}
+	pub fn best_block_info(&self) -> (BlockHash, u32) {
+		self.blocks.borrow_mut().last().map(|(a, b)| (a.block_hash(), *b)).unwrap()
+	}
 }
 
 impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
@@ -167,12 +208,12 @@ impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
 			let feeest = test_utils::TestFeeEstimator { sat_per_kw: 253 };
 			let mut deserialized_monitors = Vec::new();
 			{
-				let old_monitors = self.chain_monitor.chain_monitor.monitors.lock().unwrap();
+				let old_monitors = self.chain_monitor.chain_monitor.monitors.read().unwrap();
 				for (_, old_monitor) in old_monitors.iter() {
 					let mut w = test_utils::TestVecWriter(Vec::new());
 					old_monitor.write(&mut w).unwrap();
-					let (_, deserialized_monitor) = <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(
-						&mut ::std::io::Cursor::new(&w.0), &OnlyReadsKeysInterface {}).unwrap();
+					let (_, deserialized_monitor) = <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(
+						&mut ::std::io::Cursor::new(&w.0), self.keys_manager).unwrap();
 					deserialized_monitors.push(deserialized_monitor);
 				}
 			}
@@ -187,7 +228,7 @@ impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
 
 				let mut w = test_utils::TestVecWriter(Vec::new());
 				self.node.write(&mut w).unwrap();
-				<(BlockHash, ChannelManager<EnforcingChannelKeys, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut ::std::io::Cursor::new(w.0), ChannelManagerReadArgs {
+				<(BlockHash, ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>)>::read(&mut ::std::io::Cursor::new(w.0), ChannelManagerReadArgs {
 					default_config: UserConfig::default(),
 					keys_manager: self.keys_manager,
 					fee_estimator: &test_utils::TestFeeEstimator { sat_per_kw: 253 },
@@ -205,7 +246,7 @@ impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
 				txn_broadcasted: Mutex::new(self.tx_broadcaster.txn_broadcasted.lock().unwrap().clone())
 			};
 			let chain_source = test_utils::TestChainSource::new(Network::Testnet);
-			let chain_monitor = test_utils::TestChainMonitor::new(Some(&chain_source), &broadcaster, &self.logger, &feeest, &persister);
+			let chain_monitor = test_utils::TestChainMonitor::new(Some(&chain_source), &broadcaster, &self.logger, &feeest, &persister, &self.keys_manager);
 			for deserialized_monitor in deserialized_monitors.drain(..) {
 				if let Err(_) = chain_monitor.watch_channel(deserialized_monitor.get_funding_txo().0, deserialized_monitor) {
 					panic!();
@@ -272,6 +313,24 @@ macro_rules! get_event_msg {
 	}
 }
 
+/// Get a specific event from the pending events queue.
+#[macro_export]
+macro_rules! get_event {
+	($node: expr, $event_type: path) => {
+		{
+			let mut events = $node.node.get_and_clear_pending_events();
+			assert_eq!(events.len(), 1);
+			let ev = events.pop().unwrap();
+			match ev {
+				$event_type { .. } => {
+					ev
+				},
+				_ => panic!("Unexpected event"),
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 macro_rules! get_htlc_update_msgs {
 	($node: expr, $node_id: expr) => {
@@ -300,13 +359,14 @@ macro_rules! get_feerate {
 	}
 }
 
-#[cfg(test)]
+/// Returns any local commitment transactions for the channel.
+#[macro_export]
 macro_rules! get_local_commitment_txn {
 	($node: expr, $channel_id: expr) => {
 		{
-			let mut monitors = $node.chain_monitor.chain_monitor.monitors.lock().unwrap();
+			let monitors = $node.chain_monitor.chain_monitor.monitors.read().unwrap();
 			let mut commitment_txn = None;
-			for (funding_txo, monitor) in monitors.iter_mut() {
+			for (funding_txo, monitor) in monitors.iter() {
 				if funding_txo.to_channel_id() == $channel_id {
 					commitment_txn = Some(monitor.unsafe_get_latest_holder_commitment_txn(&$node.logger));
 					break;
@@ -412,8 +472,9 @@ pub fn create_chan_between_nodes_with_value_init<'a, 'b, 'c>(node_a: &Node<'a, '
 	tx
 }
 
-pub fn create_chan_between_nodes_with_value_confirm_first<'a, 'b, 'c, 'd>(node_recv: &'a Node<'b, 'c, 'c>, node_conf: &'a Node<'b, 'c, 'd>, tx: &Transaction) {
-	confirm_transaction(node_conf, tx);
+pub fn create_chan_between_nodes_with_value_confirm_first<'a, 'b, 'c, 'd>(node_recv: &'a Node<'b, 'c, 'c>, node_conf: &'a Node<'b, 'c, 'd>, tx: &Transaction, conf_height: u32) {
+	confirm_transaction_at(node_conf, tx, conf_height);
+	connect_blocks(node_conf, CHAN_CONFIRM_DEPTH - 1);
 	node_recv.node.handle_funding_locked(&node_conf.node.get_our_node_id(), &get_event_msg!(node_conf, MessageSendEvent::SendFundingLocked, node_recv.node.get_our_node_id()));
 }
 
@@ -438,8 +499,10 @@ pub fn create_chan_between_nodes_with_value_confirm_second<'a, 'b, 'c>(node_recv
 }
 
 pub fn create_chan_between_nodes_with_value_confirm<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, tx: &Transaction) -> ((msgs::FundingLocked, msgs::AnnouncementSignatures), [u8; 32]) {
-	create_chan_between_nodes_with_value_confirm_first(node_a, node_b, tx);
-	confirm_transaction(node_a, tx);
+	let conf_height = std::cmp::max(node_a.best_block_info().1 + 1, node_b.best_block_info().1 + 1);
+	create_chan_between_nodes_with_value_confirm_first(node_a, node_b, tx, conf_height);
+	confirm_transaction_at(node_a, tx, conf_height);
+	connect_blocks(node_a, CHAN_CONFIRM_DEPTH - 1);
 	create_chan_between_nodes_with_value_confirm_second(node_b, node_a)
 }
 
@@ -603,7 +666,7 @@ pub fn close_channel<'a, 'b, 'c>(outbound_node: &Node<'a, 'b, 'c>, inbound_node:
 	let (tx_a, tx_b);
 
 	node_a.close_channel(channel_id).unwrap();
-	node_b.handle_shutdown(&node_a.get_our_node_id(), &get_event_msg!(struct_a, MessageSendEvent::SendShutdown, node_b.get_our_node_id()));
+	node_b.handle_shutdown(&node_a.get_our_node_id(), &InitFeatures::known(), &get_event_msg!(struct_a, MessageSendEvent::SendShutdown, node_b.get_our_node_id()));
 
 	let events_1 = node_b.get_and_clear_pending_msg_events();
 	assert!(events_1.len() >= 1);
@@ -628,7 +691,7 @@ pub fn close_channel<'a, 'b, 'c>(outbound_node: &Node<'a, 'b, 'c>, inbound_node:
 		})
 	};
 
-	node_a.handle_shutdown(&node_b.get_our_node_id(), &shutdown_b);
+	node_a.handle_shutdown(&node_b.get_our_node_id(), &InitFeatures::known(), &shutdown_b);
 	let (as_update, bs_update) = if close_inbound_first {
 		assert!(node_a.get_and_clear_pending_msg_events().is_empty());
 		node_a.handle_closing_signed(&node_b.get_our_node_id(), &closing_signed_b.unwrap());
@@ -803,7 +866,7 @@ macro_rules! expect_pending_htlcs_forwardable {
 	}}
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "unstable"))]
 macro_rules! expect_payment_received {
 	($node: expr, $expected_payment_hash: expr, $expected_recv_value: expr) => {
 		let events = $node.node.get_and_clear_pending_events();
@@ -839,13 +902,13 @@ macro_rules! expect_payment_failed {
 		assert_eq!(events.len(), 1);
 		match events[0] {
 			Event::PaymentFailed { ref payment_hash, rejected_by_dest, ref error_code, ref error_data } => {
-				assert_eq!(*payment_hash, $expected_payment_hash);
-				assert_eq!(rejected_by_dest, $rejected_by_dest);
-				assert!(error_code.is_some());
-				assert!(error_data.is_some());
+				assert_eq!(*payment_hash, $expected_payment_hash, "unexpected payment_hash");
+				assert_eq!(rejected_by_dest, $rejected_by_dest, "unexpected rejected_by_dest value");
+				assert!(error_code.is_some(), "expected error_code.is_some() = true");
+				assert!(error_data.is_some(), "expected error_data.is_some() = true");
 				$(
-					assert_eq!(error_code.unwrap(), $expected_error_code);
-					assert_eq!(&error_data.as_ref().unwrap()[..], $expected_error_data);
+					assert_eq!(error_code.unwrap(), $expected_error_code, "unexpected error code");
+					assert_eq!(&error_data.as_ref().unwrap()[..], $expected_error_data, "unexpected error data");
 				)*
 			},
 			_ => panic!("Unexpected event"),
@@ -1016,12 +1079,12 @@ pub fn claim_payment<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_route:
 	claim_payment_along_route(origin_node, expected_route, false, our_payment_preimage, expected_amount);
 }
 
-pub const TEST_FINAL_CLTV: u32 = 32;
+pub const TEST_FINAL_CLTV: u32 = 50;
 
 pub fn route_payment<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_route: &[&Node<'a, 'b, 'c>], recv_value: u64) -> (PaymentPreimage, PaymentHash) {
 	let net_graph_msg_handler = &origin_node.net_graph_msg_handler;
 	let logger = test_utils::TestLogger::new();
-	let route = get_route(&origin_node.node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &expected_route.last().unwrap().node.get_our_node_id(), None, &Vec::new(), recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&origin_node.node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &expected_route.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 	assert_eq!(route.paths.len(), 1);
 	assert_eq!(route.paths[0].len(), expected_route.len());
 	for (node, hop) in expected_route.iter().zip(route.paths[0].iter()) {
@@ -1034,7 +1097,7 @@ pub fn route_payment<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_route:
 pub fn route_over_limit<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_route: &[&Node<'a, 'b, 'c>], recv_value: u64)  {
 	let logger = test_utils::TestLogger::new();
 	let net_graph_msg_handler = &origin_node.net_graph_msg_handler;
-	let route = get_route(&origin_node.node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &expected_route.last().unwrap().node.get_our_node_id(), None, &Vec::new(), recv_value, TEST_FINAL_CLTV, &logger).unwrap();
+	let route = get_route(&origin_node.node.get_our_node_id(), &net_graph_msg_handler.network_graph.read().unwrap(), &expected_route.last().unwrap().node.get_our_node_id(), None, None, &Vec::new(), recv_value, TEST_FINAL_CLTV, &logger).unwrap();
 	assert_eq!(route.paths.len(), 1);
 	assert_eq!(route.paths[0].len(), expected_route.len());
 	for (node, hop) in expected_route.iter().zip(route.paths[0].iter()) {
@@ -1132,7 +1195,10 @@ pub fn create_chanmon_cfgs(node_count: usize) -> Vec<TestChanMonCfg> {
 		let chain_source = test_utils::TestChainSource::new(Network::Testnet);
 		let logger = test_utils::TestLogger::with_id(format!("node {}", i));
 		let persister = test_utils::TestPersister::new();
-		chan_mon_cfgs.push(TestChanMonCfg{ tx_broadcaster, fee_estimator, chain_source, logger, persister });
+		let seed = [i as u8; 32];
+		let keys_manager = test_utils::TestKeysInterface::new(&seed, Network::Testnet);
+
+		chan_mon_cfgs.push(TestChanMonCfg{ tx_broadcaster, fee_estimator, chain_source, logger, persister, keys_manager });
 	}
 
 	chan_mon_cfgs
@@ -1142,30 +1208,38 @@ pub fn create_node_cfgs<'a>(node_count: usize, chanmon_cfgs: &'a Vec<TestChanMon
 	let mut nodes = Vec::new();
 
 	for i in 0..node_count {
+		let chain_monitor = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[i].chain_source), &chanmon_cfgs[i].tx_broadcaster, &chanmon_cfgs[i].logger, &chanmon_cfgs[i].fee_estimator, &chanmon_cfgs[i].persister, &chanmon_cfgs[i].keys_manager);
 		let seed = [i as u8; 32];
-		let keys_manager = test_utils::TestKeysInterface::new(&seed, Network::Testnet);
-		let chain_monitor = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[i].chain_source), &chanmon_cfgs[i].tx_broadcaster, &chanmon_cfgs[i].logger, &chanmon_cfgs[i].fee_estimator, &chanmon_cfgs[i].persister);
-		nodes.push(NodeCfg { chain_source: &chanmon_cfgs[i].chain_source, logger: &chanmon_cfgs[i].logger, tx_broadcaster: &chanmon_cfgs[i].tx_broadcaster, fee_estimator: &chanmon_cfgs[i].fee_estimator, chain_monitor, keys_manager, node_seed: seed });
+		nodes.push(NodeCfg { chain_source: &chanmon_cfgs[i].chain_source, logger: &chanmon_cfgs[i].logger, tx_broadcaster: &chanmon_cfgs[i].tx_broadcaster, fee_estimator: &chanmon_cfgs[i].fee_estimator, chain_monitor, keys_manager: &chanmon_cfgs[i].keys_manager, node_seed: seed });
 	}
 
 	nodes
 }
 
-pub fn create_node_chanmgrs<'a, 'b>(node_count: usize, cfgs: &'a Vec<NodeCfg<'b>>, node_config: &[Option<UserConfig>]) -> Vec<ChannelManager<EnforcingChannelKeys, &'a TestChainMonitor<'b>, &'b test_utils::TestBroadcaster, &'a test_utils::TestKeysInterface, &'b test_utils::TestFeeEstimator, &'b test_utils::TestLogger>> {
+pub fn create_node_chanmgrs<'a, 'b>(node_count: usize, cfgs: &'a Vec<NodeCfg<'b>>, node_config: &[Option<UserConfig>]) -> Vec<ChannelManager<EnforcingSigner, &'a TestChainMonitor<'b>, &'b test_utils::TestBroadcaster, &'a test_utils::TestKeysInterface, &'b test_utils::TestFeeEstimator, &'b test_utils::TestLogger>> {
 	let mut chanmgrs = Vec::new();
 	for i in 0..node_count {
 		let mut default_config = UserConfig::default();
+		// Set cltv_expiry_delta slightly lower to keep the final CLTV values inside one byte in our
+		// tests so that our script-length checks don't fail (see ACCEPTED_HTLC_SCRIPT_WEIGHT).
+		default_config.channel_options.cltv_expiry_delta = 6*6;
 		default_config.channel_options.announced_channel = true;
 		default_config.peer_channel_config_limits.force_announced_channel_preference = false;
 		default_config.own_channel_config.our_htlc_minimum_msat = 1000; // sanitization being done by the sender, to exerce receiver logic we need to lift of limit
-		let node = ChannelManager::new(Network::Testnet, cfgs[i].fee_estimator, &cfgs[i].chain_monitor, cfgs[i].tx_broadcaster, cfgs[i].logger, &cfgs[i].keys_manager, if node_config[i].is_some() { node_config[i].clone().unwrap() } else { default_config }, 0);
+		let network = Network::Testnet;
+		let params = ChainParameters {
+			network,
+			latest_hash: genesis_block(network).header.block_hash(),
+			latest_height: 0,
+		};
+		let node = ChannelManager::new(cfgs[i].fee_estimator, &cfgs[i].chain_monitor, cfgs[i].tx_broadcaster, cfgs[i].logger, cfgs[i].keys_manager, if node_config[i].is_some() { node_config[i].clone().unwrap() } else { default_config }, params);
 		chanmgrs.push(node);
 	}
 
 	chanmgrs
 }
 
-pub fn create_network<'a, 'b: 'a, 'c: 'b>(node_count: usize, cfgs: &'b Vec<NodeCfg<'c>>, chan_mgrs: &'a Vec<ChannelManager<EnforcingChannelKeys, &'b TestChainMonitor<'c>, &'c test_utils::TestBroadcaster, &'b test_utils::TestKeysInterface, &'c test_utils::TestFeeEstimator, &'c test_utils::TestLogger>>) -> Vec<Node<'a, 'b, 'c>> {
+pub fn create_network<'a, 'b: 'a, 'c: 'b>(node_count: usize, cfgs: &'b Vec<NodeCfg<'c>>, chan_mgrs: &'a Vec<ChannelManager<EnforcingSigner, &'b TestChainMonitor<'c>, &'c test_utils::TestBroadcaster, &'b test_utils::TestKeysInterface, &'c test_utils::TestFeeEstimator, &'c test_utils::TestLogger>>) -> Vec<Node<'a, 'b, 'c>> {
 	let mut nodes = Vec::new();
 	let chan_count = Rc::new(RefCell::new(0));
 	let payment_count = Rc::new(RefCell::new(0));
@@ -1177,13 +1251,15 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(node_count: usize, cfgs: &'b Vec<NodeC
 		                 keys_manager: &cfgs[i].keys_manager, node: &chan_mgrs[i], net_graph_msg_handler,
 		                 node_seed: cfgs[i].node_seed, network_chan_count: chan_count.clone(),
 		                 network_payment_count: payment_count.clone(), logger: cfgs[i].logger,
+		                 blocks: RefCell::new(vec![(genesis_block(Network::Testnet).header, 0)])
 		})
 	}
 
 	nodes
 }
 
-pub const ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 138; //Here we have a diff due to HTLC CLTV expiry being < 2^15 in test
+// Note that the following only works for CLTV values up to 128
+pub const ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 137; //Here we have a diff due to HTLC CLTV expiry being < 2^15 in test
 pub const OFFERED_HTLC_SCRIPT_WEIGHT: usize = 133;
 
 #[derive(PartialEq)]

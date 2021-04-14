@@ -1,0 +1,26 @@
+[package]
+name = "lightning-block-sync"
+version = "0.0.13"
+authors = ["Jeffrey Czyz", "Matt Corallo"]
+license = "MIT OR Apache-2.0"
+repository = "http://github.com/rust-bitcoin/rust-lightning"
+description = """
+Utilities to fetch the chain data from a block source and feed them into Rust Lightning.
+"""
+edition = "2018"
+
+[features]
+rest-client = [ "serde", "serde_json", "chunked_transfer" ]
+rpc-client = [ "serde", "serde_json", "chunked_transfer" ]
+
+[dependencies]
+bitcoin = {version="0.26.0-adaptor.0", git = "https://github.com/p2pderivatives/rust-bitcoin", branch = "ecdsa-adaptor", package="bitcoin"}
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning" }
+tokio = { version = "1.0", features = [ "io-util", "net" ], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+chunked_transfer = { version = "1.4", optional = true }
+futures = { version = "0.3" }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = [ "macros", "rt" ] }

@@ -1,8 +1,8 @@
 [package]
 name = "lightning"
-version = "0.0.12"
+version = "0.0.13-adaptor.0"
 authors = ["Matt Corallo"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-bitcoin/rust-lightning/"
 description = """
 A Bitcoin Lightning library in Rust.
@@ -11,6 +11,7 @@ Still missing tons of error-handling. See GitHub issues for suggested projects i
 """
 
 [features]
+allow_wallclock_use = []
 fuzztarget = ["bitcoin/fuzztarget", "regex"]
 # Internal test utilities exposed to other repo crates
 _test_utils = ["hex", "regex"]
@@ -23,17 +24,23 @@ max_level_debug = []
 # Allow signing of local transactions that may have been revoked or will be revoked, for functional testing (e.g. justice tx handling).
 # This is unsafe to use in production because it may result in the counterparty publishing taking our funds.
 unsafe_revoked_tx_signing = []
+unstable = []
 
 [dependencies]
-bitcoin = "0.24"
+bitcoin = {version="0.26.0-adaptor.0", git = "https://github.com/p2pderivatives/rust-bitcoin", branch = "ecdsa-adaptor", package="bitcoin"}
 
 hex = { version = "0.3", optional = true }
 regex = { version = "0.1.80", optional = true }
 
 [dev-dependencies.bitcoin]
-version = "0.24"
+version = "0.26.0-adaptor.0"
+git = "https://github.com/p2pderivatives/rust-bitcoin"
+branch = "ecdsa-adaptor"
 features = ["bitcoinconsensus"]
 
 [dev-dependencies]
 hex = "0.3"
 regex = "0.1.80"
+
+[package.metadata.docs.rs]
+features = ["allow_wallclock_use"] # When https://github.com/rust-lang/rust/issues/43781 complies with our MSVR, we can add nice banners in the docs for the methods behind this feature-gate.

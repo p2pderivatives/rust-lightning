@@ -1,20 +1,29 @@
 [package]
 name = "lightning-persister"
-version = "0.0.1"
+version = "0.0.13"
 authors = ["Valentine Wallace", "Matt Corallo"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-bitcoin/rust-lightning/"
 description = """
-Utilities to manage channel data persistence and retrieval.
+Utilities to manage Rust-Lightning channel data persistence and retrieval.
 """
 
+[features]
+unstable = ["lightning/unstable"]
+
 [dependencies]
-bitcoin = "0.24"
-lightning = { version = "0.0.12", path = "../lightning" }
+bitcoin = {version="0.26.0-adaptor.0", git = "https://github.com/p2pderivatives/rust-bitcoin", branch = "ecdsa-adaptor", package="bitcoin"}
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning" }
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase"] }
+
 [dev-dependencies.bitcoin]
-version = "0.24"
+version = "0.26.0-adaptor.0"
+git = "https://github.com/p2pderivatives/rust-bitcoin"
+branch = "ecdsa-adaptor"
 features = ["bitcoinconsensus"]
 
 [dev-dependencies]
-lightning = { version = "0.0.12", path = "../lightning", features = ["_test_utils"] }
+lightning = { version = "0.0.13-adaptor.0", path = "../lightning", features = ["_test_utils"] }

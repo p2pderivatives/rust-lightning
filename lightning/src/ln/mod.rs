@@ -18,6 +18,10 @@
 //! you want to learn things about the network topology (eg get a route for sending a payment),
 //! call into your NetGraphMsgHandler.
 
+#[cfg(any(test, feature = "_test_utils"))]
+#[macro_use]
+pub mod functional_test_utils;
+
 pub mod channelmanager;
 pub mod msgs;
 pub mod peer_handler;
@@ -32,15 +36,12 @@ pub(crate) mod peer_channel_encryptor;
 
 mod channel;
 mod onion_utils;
-mod wire;
+pub mod wire;
 
 // Older rustc (which we support) refuses to let us call the get_payment_preimage_hash!() macro
 // without the node parameter being mut. This is incorrect, and thus newer rustcs will complain
 // about an unnecessary mut. Thus, we silence the unused_mut warning in two test modules below.
 
-#[cfg(any(test, feature = "_test_utils"))]
-#[macro_use]
-pub mod functional_test_utils;
 #[cfg(test)]
 #[allow(unused_mut)]
 mod functional_tests;

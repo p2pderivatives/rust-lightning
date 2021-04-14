@@ -8,8 +8,7 @@
 // licenses.
 
 //! Various utilities for building scripts and deriving keys related to channels. These are
-//! largely of interest for those implementing chain::keysinterface::ChannelKeys message signing
-//! by hand.
+//! largely of interest for those implementing chain::keysinterface::Sign message signing by hand.
 
 use bitcoin::blockdata::script::{Script,Builder};
 use bitcoin::blockdata::opcodes;
@@ -384,11 +383,16 @@ impl TxCreationKeys {
 	}
 }
 
+/// The maximum length of a script returned by get_revokeable_redeemscript.
+// Calculated as 6 bytes of opcodes, 1 byte push plus 2 bytes for contest_delay, and two public
+// keys of 33 bytes (+ 1 push).
+pub const REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH: usize = 6 + 3 + 34*2;
+
 /// A script either spendable by the revocation
 /// key or the broadcaster_delayed_payment_key and satisfying the relative-locktime OP_CSV constrain.
 /// Encumbering a `to_holder` output on a commitment transaction or 2nd-stage HTLC transactions.
 pub fn get_revokeable_redeemscript(revocation_key: &PublicKey, contest_delay: u16, broadcaster_delayed_payment_key: &PublicKey) -> Script {
-	Builder::new().push_opcode(opcodes::all::OP_IF)
+	let res = Builder::new().push_opcode(opcodes::all::OP_IF)
 	              .push_slice(&revocation_key.serialize())
 	              .push_opcode(opcodes::all::OP_ELSE)
 	              .push_int(contest_delay as i64)
@@ -397,7 +401,9 @@ pub fn get_revokeable_redeemscript(revocation_key: &PublicKey, contest_delay: u1
 	              .push_slice(&broadcaster_delayed_payment_key.serialize())
 	              .push_opcode(opcodes::all::OP_ENDIF)
 	              .push_opcode(opcodes::all::OP_CHECKSIG)
-	              .into_script()
+	              .into_script();
+	debug_assert!(res.len() <= REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH);
+	res
 }
 
 #[derive(Clone, PartialEq)]
@@ -843,6 +849,7 @@ impl PartialEq for CommitmentTransaction {
 	}
 }
 
+/// (C-not exported) as users never need to call this directly
 impl Writeable for Vec<HTLCOutputInCommitment> {
 	#[inline]
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
@@ -854,6 +861,7 @@ impl Writeable for Vec<HTLCOutputInCommitment> {
 	}
 }
 
+/// (C-not exported) as users never need to call this directly
 impl Readable for Vec<HTLCOutputInCommitment> {
 	#[inline]
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
@@ -889,6 +897,8 @@ impl CommitmentTransaction {
 	/// This auxiliary data is not stored in this object.
 	///
 	/// Only include HTLCs that are above the dust limit for the channel.
+	///
+	/// (C-not exported) due to the generic though we likely should expose a version without
 	pub fn new_with_auxiliary_htlc_data<T>(commitment_number: u64, to_broadcaster_value_sat: u64, to_countersignatory_value_sat: u64, keys: TxCreationKeys, feerate_per_kw: u32, htlcs_with_aux: &mut Vec<(HTLCOutputInCommitment, T)>, channel_parameters: &DirectedChannelTransactionParameters) -> CommitmentTransaction {
 		// Sort outputs and populate output indices while keeping track of the auxiliary data
 		let (outputs, htlcs) = Self::internal_build_outputs(&keys, to_broadcaster_value_sat, to_countersignatory_value_sat, htlcs_with_aux, channel_parameters).unwrap();
@@ -1056,6 +1066,9 @@ impl CommitmentTransaction {
 	/// The non-dust HTLCs (direction, amt, height expiration, hash, transaction output index)
 	/// which were included in this commitment transaction in output order.
 	/// The transaction index is always populated.
+	///
+	/// (C-not exported) as we cannot currently convert Vec references to/from C, though we should
+	/// expose a less effecient version which creates a Vec of references in the future.
 	pub fn htlcs(&self) -> &Vec<HTLCOutputInCommitment> {
 		&self.htlcs
 	}

@@ -17,7 +17,9 @@ use std::sync::Mutex;
 use std::cmp;
 
 use bitcoin::secp256k1::Signature;
+use bitcoin::secp256k1::constants::{SCHNORRSIG_SIGNATURE_SIZE, SCHNORRSIG_PUBLIC_KEY_SIZE};
 use bitcoin::secp256k1::key::{PublicKey, SecretKey};
+use bitcoin::secp256k1::schnorrsig;
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxOut};
 use bitcoin::consensus;
@@ -84,7 +86,7 @@ impl Writer for VecWriter {
 
 /// Writer that only tracks the amount of data written - useful if you need to calculate the length
 /// of some data when serialized but don't yet need the full data.
-pub(crate) struct LengthCalculatingWriter(pub usize);
+pub struct LengthCalculatingWriter(pub usize);
 impl Writer for LengthCalculatingWriter {
 	#[inline]
 	fn write_all(&mut self, buf: &[u8]) -> Result<(), ::std::io::Error> {
@@ -97,20 +99,23 @@ impl Writer for LengthCalculatingWriter {
 
 /// Essentially std::io::Take but a bit simpler and with a method to walk the underlying stream
 /// forward to ensure we always consume exactly the fixed length specified.
-pub(crate) struct FixedLengthReader<R: Read> {
+pub struct FixedLengthReader<R: Read> {
 	read: R,
 	bytes_read: u64,
 	total_bytes: u64,
 }
 impl<R: Read> FixedLengthReader<R> {
+	/// Create a new FixedLengthReader.
 	pub fn new(read: R, total_bytes: u64) -> Self {
 		Self { read, bytes_read: 0, total_bytes }
 	}
 
+	/// Whether the reader has remaining bytes to read.
 	pub fn bytes_remain(&mut self) -> bool {
 		self.bytes_read != self.total_bytes
 	}
 
+	/// Eat the remaining of the reader.
 	pub fn eat_remaining(&mut self) -> Result<(), DecodeError> {
 		::std::io::copy(self, &mut ::std::io::sink()).unwrap();
 		if self.bytes_read != self.total_bytes {
@@ -120,6 +125,7 @@ impl<R: Read> FixedLengthReader<R> {
 		}
 	}
 }
+
 impl<R: Read> Read for FixedLengthReader<R> {
 	fn read(&mut self, dest: &mut [u8]) -> Result<usize, ::std::io::Error> {
 		if self.total_bytes == self.bytes_read {
@@ -139,16 +145,23 @@ impl<R: Read> Read for FixedLengthReader<R> {
 
 /// A Read which tracks whether any bytes have been read at all. This allows us to distinguish
 /// between "EOF reached before we started" and "EOF reached mid-read".
-pub(crate) struct ReadTrackingReader<R: Read> {
+pub struct ReadTrackingReader<R: Read> {
 	read: R,
+	/// Whether any bytes have been read or not.
 	pub have_read: bool,
 }
+
+/// Implementation for ReadTrackingReader.
 impl<R: Read> ReadTrackingReader<R> {
+	/// Create a new ReadTrackingReader.
 	pub fn new(read: R) -> Self {
 		Self { read, have_read: false }
 	}
 }
+
+/// Implements the Read trait for ReadTrackingReader.
 impl<R: Read> Read for ReadTrackingReader<R> {
+	/// Read into the given buffer.
 	fn read(&mut self, dest: &mut [u8]) -> Result<usize, ::std::io::Error> {
 		match self.read.read(dest) {
 			Ok(0) => Ok(0),
@@ -244,7 +257,7 @@ impl Readable for U48 {
 /// encoded in several different ways, which we must check for at deserialization-time. Thus, if
 /// you're looking for an example of a variable-length integer to use for your own project, move
 /// along, this is a rather poor design.
-pub(crate) struct BigSize(pub u64);
+pub struct BigSize(pub u64);
 impl Writeable for BigSize {
 	#[inline]
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ::std::io::Error> {
@@ -425,6 +438,8 @@ impl_array!(16); // for IPv6
 impl_array!(32); // for channel id & hmac
 impl_array!(33); // for PublicKey
 impl_array!(64); // for Signature
+impl_array!(65); // for AdaptorSignature
+impl_array!(97); // for AdaptorProof
 impl_array!(1300); // for OnionPacket.hop_data
 
 // HashMap
@@ -477,6 +492,7 @@ impl Readable for Vec<u8> {
 		Ok(ret)
 	}
 }
+
 impl Writeable for Vec<Signature> {
 	#[inline]
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
@@ -500,6 +516,60 @@ impl Readable for Vec<Signature> {
 		}
 		let mut ret = Vec::with_capacity(len as usize);
 		for _ in 0..len { ret.push(Signature::read(r)?); }
+		Ok(ret)
+	}
+}
+
+impl Writeable for Vec<schnorrsig::Signature> {
+	#[inline]
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		(self.len() as u16).write(w)?;
+		for e in self.iter() {
+			e.write(w)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for Vec<schnorrsig::Signature> {
+	#[inline]
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let len: u16 = Readable::read(r)?;
+		let byte_size = (len as usize)
+		                .checked_mul(SCHNORRSIG_SIGNATURE_SIZE)
+		                .ok_or(DecodeError::BadLengthDescriptor)?;
+		if byte_size > MAX_BUF_SIZE {
+			return Err(DecodeError::BadLengthDescriptor);
+		}
+		let mut ret = Vec::with_capacity(len as usize);
+		for _ in 0..len { ret.push(schnorrsig::Signature::read(r)?); }
+		Ok(ret)
+	}
+}
+
+impl Writeable for Vec<schnorrsig::PublicKey> {
+	#[inline]
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		(self.len() as u16).write(w)?;
+		for e in self.iter() {
+			e.write(w)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for Vec<schnorrsig::PublicKey> {
+	#[inline]
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let len: u16 = Readable::read(r)?;
+		let byte_size = (len as usize)
+		                .checked_mul(SCHNORRSIG_PUBLIC_KEY_SIZE)
+		                .ok_or(DecodeError::BadLengthDescriptor)?;
+		if byte_size > MAX_BUF_SIZE {
+			return Err(DecodeError::BadLengthDescriptor);
+		}
+		let mut ret = Vec::with_capacity(len as usize);
+		for _ in 0..len { ret.push(schnorrsig::PublicKey::read(r)?); }
 		Ok(ret)
 	}
 }
@@ -530,6 +600,22 @@ impl Readable for PublicKey {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; 33] = Readable::read(r)?;
 		match PublicKey::from_slice(&buf) {
+			Ok(key) => Ok(key),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for schnorrsig::PublicKey {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		self.serialize().write(w)
+	}
+}
+
+impl Readable for schnorrsig::PublicKey {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; 33] = Readable::read(r)?;
+		match schnorrsig::PublicKey::from_slice(&buf) {
 			Ok(key) => Ok(key),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
@@ -579,6 +665,22 @@ impl Readable for Signature {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; 64] = Readable::read(r)?;
 		match Signature::from_compact(&buf) {
+			Ok(sig) => Ok(sig),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for schnorrsig::Signature {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		self.as_ref().write(w)
+	}
+}
+
+impl Readable for schnorrsig::Signature {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; 64] = Readable::read(r)?;
+		match schnorrsig::Signature::from_slice(&buf) {
 			Ok(sig) => Ok(sig),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
@@ -707,8 +809,7 @@ macro_rules! impl_consensus_ser {
 			fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ::std::io::Error> {
 				match self.consensus_encode(WriterWriteAdaptor(writer)) {
 					Ok(_) => Ok(()),
-					Err(consensus::encode::Error::Io(e)) => Err(e),
-					Err(_) => panic!("We shouldn't get a consensus::encode::Error unless our Write generated an std::io::Error"),
+					Err(e) => Err(e),
 				}
 			}
 		}
@@ -718,7 +819,7 @@ macro_rules! impl_consensus_ser {
 				match consensus::encode::Decodable::consensus_decode(r) {
 					Ok(t) => Ok(t),
 					Err(consensus::encode::Error::Io(ref e)) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => Err(DecodeError::ShortRead),
-					Err(consensus::encode::Error::Io(e)) => Err(DecodeError::Io(e)),
+					Err(consensus::encode::Error::Io(e)) => Err(DecodeError::Io(e.kind())),
 					Err(_) => Err(DecodeError::InvalidValue),
 				}
 			}

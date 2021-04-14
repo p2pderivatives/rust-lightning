@@ -13,8 +13,8 @@ jobs:
                      1.30.0,
                      # 1.34.2 is Debian stable
                      1.34.2,
-                     # 1.39.0 is MSRV for lightning-net-tokio and generates coverage
-                     1.39.0]
+                     # 1.45.2 is MSRV for lightning-net-tokio, lightning-block-sync, and coverage generation
+                     1.45.2]
         include:
           - toolchain: stable
             build-net-tokio: true
@@ -26,7 +26,7 @@ jobs:
             build-net-tokio: true
           - toolchain: beta
             build-net-tokio: true
-          - toolchain: 1.39.0
+          - toolchain: 1.45.2
             build-net-tokio: true
             coverage: true
     runs-on: ${{ matrix.platform }}
@@ -48,6 +48,24 @@ jobs:
       - name: Build on Rust ${{ matrix.toolchain }}
         if: "! matrix.build-net-tokio"
         run: cargo build --verbose  --color always -p lightning
+      - name: Build Block Sync Clients on Rust ${{ matrix.toolchain }} with features
+        if: "matrix.build-net-tokio && !matrix.coverage"
+        run: |
+          cd lightning-block-sync
+          cargo build --verbose --color always --features rest-client
+          cargo build --verbose --color always --features rpc-client
+          cargo build --verbose --color always --features rpc-client,rest-client
+          cargo build --verbose --color always --features rpc-client,rest-client,tokio
+          cd ..
+      - name: Build Block Sync Clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
+        if: matrix.coverage
+        run: |
+          cd lightning-block-sync
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rest-client
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client,tokio
+          cd ..
       - name: Test on Rust ${{ matrix.toolchain }} with net-tokio
         if: "matrix.build-net-tokio && !matrix.coverage"
         run: cargo test --verbose --color always
@@ -57,6 +75,24 @@ jobs:
       - name: Test on Rust ${{ matrix.toolchain }}
         if: "! matrix.build-net-tokio"
         run: cargo test --verbose --color always  -p lightning
+      - name: Test Block Sync Clients on Rust ${{ matrix.toolchain }} with features
+        if: "matrix.build-net-tokio && !matrix.coverage"
+        run: |
+          cd lightning-block-sync
+          cargo test --verbose --color always --features rest-client
+          cargo test --verbose --color always --features rpc-client
+          cargo test --verbose --color always --features rpc-client,rest-client
+          cargo test --verbose --color always --features rpc-client,rest-client,tokio
+          cd ..
+      - name: Test Block Sync Clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
+        if: matrix.coverage
+        run: |
+          cd lightning-block-sync
+          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rest-client
+          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client
+          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client
+          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client,tokio
+          cd ..
       - name: Install deps for kcov
         if: matrix.coverage
         run: |
@@ -75,7 +111,7 @@ jobs:
       - name: Generate coverage report
         if: matrix.coverage
         run: |
-          for file in target/debug/lightning-*; do
+          for file in target/debug/deps/lightning*; do
             [ -x "${file}" ] || continue;
             mkdir -p "target/cov/$(basename $file)";
             ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file";
@@ -89,6 +125,39 @@ jobs:
           # Maybe if codecov wasn't broken we wouldn't need to do this...
           token: f421b687-4dc2-4387-ac3d-dc3b2528af57
           fail_ci_if_error: true
+
+  benchmark:
+    runs-on: ubuntu-latest
+    env:
+      TOOLCHAIN: nightly
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+      - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          override: true
+          profile: minimal
+      - name: Cache routing graph snapshot
+        id: cache-graph
+        uses: actions/cache@v2
+        with:
+          path: lightning/net_graph-2021-02-12.bin
+          key: net_graph-2021-02-12
+      - name: Fetch routing graph snapshot
+        if: steps.cache-graph.outputs.cache-hit != 'true'
+        run: |
+          wget -O lightning/net_graph-2021-02-12.bin https://bitcoin.ninja/ldk-net_graph-879e309c128-2020-02-12.bin
+          if [ "$(sha256sum lightning/net_graph-2021-02-12.bin | awk '{ print $1 }')" != "890a1f80dfb6ef674a1e4ff0f23cd73d740731c395f99d85abbede0cfbb701ab" ]; then
+            echo "Bad hash"
+            exit 1
+          fi
+      - name: Run benchmarks on Rust ${{ matrix.toolchain }}
+        run: |
+          cd lightning
+          cargo bench --features unstable
+          cd ..
 
   check_commits:
     runs-on: ubuntu-latest
@@ -133,54 +202,14 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install build-essential binutils-dev libunwind-dev
       - name: Sanity check fuzz targets on Rust ${{ env.TOOLCHAIN }}
-        run: cd fuzz && cargo test --verbose --color always
+        run: cd fuzz && RUSTFLAGS="--cfg=fuzzing" cargo test --verbose --color always
       - name: Run fuzzers
         run: cd fuzz && ./ci-fuzz.sh
-
-  check_bindings:
-    runs-on: ubuntu-latest
-    # Ubuntu's version of rustc uses its own LLVM instead of being a real native package.
-    # This leaves us with an incompatible LLVM version when linking. Instead, use a real OS.
-    # We further (temporarily) use Debian experimental since testing links rustc against the
-    # brand-new llvm-10, but clang/llvm still default to LLVM 9.
-    container: debian:experimental
-    env:
-      TOOLCHAIN: stable
-    steps:
-      - name: Install native Rust toolchain, Valgrind, and build utilitis
-        run: |
-          echo 'Package: llvm llvm-runtime clang lld' > /etc/apt/preferences.d/99-llvm10
-          echo 'Pin: release n=experimental' >> /etc/apt/preferences.d/99-llvm10
-          echo 'Pin-Priority: 995' >> /etc/apt/preferences.d/99-llvm10
-          apt-get update
-          apt-get -y dist-upgrade
-          apt-get -y install cargo valgrind lld git g++ clang
-      - name: Checkout source code
-        uses: actions/checkout@v2
-      - name: Sanity test bindings
-        working-directory: lightning-c-bindings
-        run: cargo check
-      - name: Install cbindgen
-        run: cargo install --force cbindgen
-      - name: Rebuild bindings, and check the sample app builds + links
-        run: ./genbindings.sh
-      - name: Check that the latest bindings are in git
-        run: |
-          if [ "$(git diff)" != "" ]; then
-            # cbindgen's bindings output order can be FS-dependant, so check that the lines are all the same:
-            mv lightning-c-bindings/include/lightning.h lightning-c-bindings/include/lightning.h.new
-            git checkout lightning-c-bindings/include/lightning.h
-            cat lightning-c-bindings/include/lightning.h | grep -v "Generated with cbindgen:[0-9\.]*" | sort > lightning-c-bindings/include/lightning.h.sorted
-            cat lightning-c-bindings/include/lightning.h.new | grep -v "Generated with cbindgen:[0-9\.]*" | sort > lightning-c-bindings/include/lightning.h.new.sorted
-            diff lightning-c-bindings/include/lightning.h.sorted lightning-c-bindings/include/lightning.h.new.sorted
-            [ "$(diff lightning-c-bindings/include/lightning.h.sorted lightning-c-bindings/include/lightning.h.new.sorted)" != "" ] && exit 2
-            git diff --exit-code
-          fi
 
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.39.0
+      TOOLCHAIN: 1.45.2
     steps:
       - name: Checkout source code
         uses: actions/checkout@v2

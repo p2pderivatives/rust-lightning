@@ -19,6 +19,7 @@
 //! channel being force-closed.
 
 use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::transaction::{Transaction, TxOut};
 use bitcoin::blockdata::script::{Builder, Script};
 use bitcoin::blockdata::opcodes;
@@ -34,11 +35,11 @@ use lightning::chain::channelmonitor;
 use lightning::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdateErr, MonitorEvent};
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
-use lightning::chain::keysinterface::{KeysInterface, InMemoryChannelKeys};
-use lightning::ln::channelmanager::{ChannelManager, PaymentHash, PaymentPreimage, PaymentSecret, PaymentSendFailure, ChannelManagerReadArgs};
+use lightning::chain::keysinterface::{KeysInterface, InMemorySigner};
+use lightning::ln::channelmanager::{ChainParameters, ChannelManager, PaymentHash, PaymentPreimage, PaymentSecret, PaymentSendFailure, ChannelManagerReadArgs};
 use lightning::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use lightning::ln::msgs::{CommitmentUpdate, ChannelMessageHandler, DecodeError, ErrorAction, UpdateAddHTLC, Init};
-use lightning::util::enforcing_trait_impls::EnforcingChannelKeys;
+use lightning::util::enforcing_trait_impls::{EnforcingSigner, INITIAL_REVOKED_COMMITMENT_NUMBER};
 use lightning::util::errors::APIError;
 use lightning::util::events;
 use lightning::util::logger::Logger;
@@ -87,7 +88,7 @@ impl Writer for VecWriter {
 
 struct TestChainMonitor {
 	pub logger: Arc<dyn Logger>,
-	pub chain_monitor: Arc<chainmonitor::ChainMonitor<EnforcingChannelKeys, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
+	pub chain_monitor: Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	pub update_ret: Mutex<Result<(), channelmonitor::ChannelMonitorUpdateErr>>,
 	// If we reload a node with an old copy of ChannelMonitors, the ChannelManager deserialization
 	// logic will automatically force-close our channels for us (as we don't have an up-to-date
@@ -108,10 +109,8 @@ impl TestChainMonitor {
 		}
 	}
 }
-impl chain::Watch for TestChainMonitor {
-	type Keys = EnforcingChannelKeys;
-
-	fn watch_channel(&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<EnforcingChannelKeys>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
+impl chain::Watch<EnforcingSigner> for TestChainMonitor {
+	fn watch_channel(&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<EnforcingSigner>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
 		let mut ser = VecWriter(Vec::new());
 		monitor.write(&mut ser).unwrap();
 		if let Some(_) = self.latest_monitors.lock().unwrap().insert(funding_txo, (monitor.get_latest_update_id(), ser.0)) {
@@ -128,7 +127,7 @@ impl chain::Watch for TestChainMonitor {
 			hash_map::Entry::Occupied(entry) => entry,
 			hash_map::Entry::Vacant(_) => panic!("Didn't have monitor on update call"),
 		};
-		let mut deserialized_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::
+		let deserialized_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::
 			read(&mut Cursor::new(&map_entry.get().1), &OnlyReadsKeysInterface {}).unwrap().1;
 		deserialized_monitor.update_monitor(&update, &&TestBroadcaster{}, &&FuzzEstimator{}, &self.logger).unwrap();
 		let mut ser = VecWriter(Vec::new());
@@ -146,9 +145,10 @@ impl chain::Watch for TestChainMonitor {
 struct KeyProvider {
 	node_id: u8,
 	rand_bytes_id: atomic::AtomicU8,
+	revoked_commitments: Mutex<HashMap<[u8;32], Arc<Mutex<u64>>>>,
 }
 impl KeysInterface for KeyProvider {
-	type ChanKeySigner = EnforcingChannelKeys;
+	type Signer = EnforcingSigner;
 
 	fn get_node_secret(&self) -> SecretKey {
 		SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.node_id]).unwrap()
@@ -166,19 +166,22 @@ impl KeysInterface for KeyProvider {
 		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, self.node_id]).unwrap())
 	}
 
-	fn get_channel_keys(&self, _inbound: bool, channel_value_satoshis: u64) -> EnforcingChannelKeys {
+	fn get_channel_signer(&self, _inbound: bool, channel_value_satoshis: u64) -> EnforcingSigner {
 		let secp_ctx = Secp256k1::signing_only();
-		EnforcingChannelKeys::new(InMemoryChannelKeys::new(
+		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed);
+		let keys = InMemorySigner::new(
 			&secp_ctx,
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, self.node_id]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, self.node_id]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, self.node_id]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, self.node_id]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, self.node_id]).unwrap(),
-			[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_id],
+			[id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_id],
 			channel_value_satoshis,
-			(0, 0),
-		))
+			[0; 32],
+		);
+		let revoked_commitment = self.make_revoked_commitment_cell(keys.commitment_seed);
+		EnforcingSigner::new_with_revoked(keys, revoked_commitment, false)
 	}
 
 	fn get_secure_random_bytes(&self) -> [u8; 32] {
@@ -186,8 +189,31 @@ impl KeysInterface for KeyProvider {
 		[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, id, 11, self.node_id]
 	}
 
-	fn read_chan_signer(&self, data: &[u8]) -> Result<EnforcingChannelKeys, DecodeError> {
-		EnforcingChannelKeys::read(&mut std::io::Cursor::new(data))
+	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, DecodeError> {
+		let mut reader = std::io::Cursor::new(buffer);
+
+		let inner: InMemorySigner = Readable::read(&mut reader)?;
+		let revoked_commitment = self.make_revoked_commitment_cell(inner.commitment_seed);
+
+		let last_commitment_number = Readable::read(&mut reader)?;
+
+		Ok(EnforcingSigner {
+			inner,
+			last_commitment_number: Arc::new(Mutex::new(last_commitment_number)),
+			revoked_commitment,
+			disable_revocation_policy_check: false,
+		})
+	}
+}
+
+impl KeyProvider {
+	fn make_revoked_commitment_cell(&self, commitment_seed: [u8; 32]) -> Arc<Mutex<u64>> {
+		let mut revoked_commitments = self.revoked_commitments.lock().unwrap();
+		if !revoked_commitments.contains_key(&commitment_seed) {
+			revoked_commitments.insert(commitment_seed, Arc::new(Mutex::new(INITIAL_REVOKED_COMMITMENT_NUMBER)));
+		}
+		let cell = revoked_commitments.get(&commitment_seed).unwrap();
+		Arc::clone(cell)
 	}
 }
 
@@ -208,7 +234,7 @@ fn check_api_err(api_err: APIError) {
 				_ if err.starts_with("Cannot send value that would put our balance under counterparty-announced channel reserve value") => {},
 				_ if err.starts_with("Cannot send value that would overdraw remaining funds.") => {},
 				_ if err.starts_with("Cannot send value that would not leave enough to pay for fees.") => {},
-				_ => panic!(err),
+				_ => panic!("{}", err),
 			}
 		},
 		APIError::MonitorUpdateFailed => {
@@ -232,7 +258,7 @@ fn check_payment_err(send_err: PaymentSendFailure) {
 	}
 }
 
-type ChanMan = ChannelManager<EnforcingChannelKeys, Arc<TestChainMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>, Arc<dyn Logger>>;
+type ChanMan = ChannelManager<EnforcingSigner, Arc<TestChainMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>, Arc<dyn Logger>>;
 
 #[inline]
 fn send_payment(source: &ChanMan, dest: &ChanMan, dest_chan_id: u64, amt: u64, payment_id: &mut u8) -> bool {
@@ -288,22 +314,28 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
 			let monitor = Arc::new(TestChainMonitor::new(broadcast.clone(), logger.clone(), fee_est.clone(), Arc::new(TestPersister{})));
 
-			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, rand_bytes_id: atomic::AtomicU8::new(0) });
+			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, rand_bytes_id: atomic::AtomicU8::new(0), revoked_commitments: Mutex::new(HashMap::new()) });
 			let mut config = UserConfig::default();
 			config.channel_options.fee_proportional_millionths = 0;
 			config.channel_options.announced_channel = true;
 			config.peer_channel_config_limits.min_dust_limit_satoshis = 0;
-			(ChannelManager::new(Network::Bitcoin, fee_est.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, 0),
-			monitor)
+			let network = Network::Bitcoin;
+			let params = ChainParameters {
+				network,
+				latest_hash: genesis_block(network).block_hash(),
+				latest_height: 0,
+			};
+			(ChannelManager::new(fee_est.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, params),
+			monitor, keys_manager)
 		} }
 	}
 
 	macro_rules! reload_node {
-		($ser: expr, $node_id: expr, $old_monitors: expr) => { {
+		($ser: expr, $node_id: expr, $old_monitors: expr, $keys_manager: expr) => { {
+		    let keys_manager = Arc::clone(& $keys_manager);
 			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
 			let chain_monitor = Arc::new(TestChainMonitor::new(broadcast.clone(), logger.clone(), fee_est.clone(), Arc::new(TestPersister{})));
 
-			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, rand_bytes_id: atomic::AtomicU8::new(0) });
 			let mut config = UserConfig::default();
 			config.channel_options.fee_proportional_millionths = 0;
 			config.channel_options.announced_channel = true;
@@ -312,7 +344,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 			let mut monitors = HashMap::new();
 			let mut old_monitors = $old_monitors.latest_monitors.lock().unwrap();
 			for (outpoint, (update_id, monitor_ser)) in old_monitors.drain() {
-				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut Cursor::new(&monitor_ser), &OnlyReadsKeysInterface {}).expect("Failed to read monitor").1);
+				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut Cursor::new(&monitor_ser), &OnlyReadsKeysInterface {}).expect("Failed to read monitor").1);
 				chain_monitor.latest_monitors.lock().unwrap().insert(outpoint, (update_id, monitor_ser));
 			}
 			let mut monitor_refs = HashMap::new();
@@ -400,7 +432,8 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 
 	macro_rules! confirm_txn {
 		($node: expr) => { {
-			let mut header = BlockHeader { version: 0x20000000, prev_blockhash: Default::default(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
+			let chain_hash = genesis_block(Network::Bitcoin).block_hash();
+			let mut header = BlockHeader { version: 0x20000000, prev_blockhash: chain_hash, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 			let txdata: Vec<_> = channel_txn.iter().enumerate().map(|(i, tx)| (i + 1, tx)).collect();
 			$node.block_connected(&header, &txdata, 1);
 			for i in 2..100 {
@@ -440,9 +473,9 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 
 	// 3 nodes is enough to hit all the possible cases, notably unknown-source-unknown-dest
 	// forwarding.
-	let (node_a, mut monitor_a) = make_node!(0);
-	let (node_b, mut monitor_b) = make_node!(1);
-	let (node_c, mut monitor_c) = make_node!(2);
+	let (node_a, mut monitor_a, keys_manager_a) = make_node!(0);
+	let (node_b, mut monitor_b, keys_manager_b) = make_node!(1);
+	let (node_c, mut monitor_c, keys_manager_c) = make_node!(2);
 
 	let mut nodes = [node_a, node_b, node_c];
 
@@ -793,7 +826,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 					chan_a_disconnected = true;
 					drain_msg_events_on_disconnect!(0);
 				}
-				let (new_node_a, new_monitor_a) = reload_node!(node_a_ser, 0, monitor_a);
+				let (new_node_a, new_monitor_a) = reload_node!(node_a_ser, 0, monitor_a, keys_manager_a);
 				nodes[0] = new_node_a;
 				monitor_a = new_monitor_a;
 			},
@@ -810,7 +843,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 					nodes[2].get_and_clear_pending_msg_events();
 					bc_events.clear();
 				}
-				let (new_node_b, new_monitor_b) = reload_node!(node_b_ser, 1, monitor_b);
+				let (new_node_b, new_monitor_b) = reload_node!(node_b_ser, 1, monitor_b, keys_manager_b);
 				nodes[1] = new_node_b;
 				monitor_b = new_monitor_b;
 			},
@@ -820,7 +853,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 					chan_b_disconnected = true;
 					drain_msg_events_on_disconnect!(2);
 				}
-				let (new_node_c, new_monitor_c) = reload_node!(node_c_ser, 2, monitor_c);
+				let (new_node_c, new_monitor_c) = reload_node!(node_c_ser, 2, monitor_c, keys_manager_c);
 				nodes[2] = new_node_c;
 				monitor_c = new_monitor_c;
 			},

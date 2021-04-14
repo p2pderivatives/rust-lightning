@@ -12,8 +12,7 @@
 //! Lightning nodes advertise a supported set of operation through feature flags. Features are
 //! applicable for a specific context as indicated in some [messages]. [`Features`] encapsulates
 //! behavior for specifying and checking feature flags for a particular context. Each feature is
-//! defined internally by a trait specifying the corresponding flags (i.e., even and odd bits). A
-//! [`Context`] is used to parameterize [`Features`] and defines which features it can support.
+//! defined internally by a trait specifying the corresponding flags (i.e., even and odd bits).
 //!
 //! Whether a feature is considered "known" or "unknown" is relative to the implementation, whereas
 //! the term "supports" is used in reference to a particular set of [`Features`]. That is, a node
@@ -21,22 +20,19 @@
 //! And the implementation can interpret a feature if the feature is known to it.
 //!
 //! [BOLT #9]: https://github.com/lightningnetwork/lightning-rfc/blob/master/09-features.md
-//! [messages]: ../msgs/index.html
-//! [`Features`]: struct.Features.html
-//! [`Context`]: sealed/trait.Context.html
+//! [messages]: crate::ln::msgs
 
 use std::{cmp, fmt};
-use std::result::Result;
 use std::marker::PhantomData;
 
 use ln::msgs::DecodeError;
 use util::ser::{Readable, Writeable, Writer};
 
 mod sealed {
+	use ln::features::Features;
+
 	/// The context in which [`Features`] are applicable. Defines which features are required and
 	/// which are optional for the context.
-	///
-	/// [`Features`]: ../struct.Features.html
 	pub trait Context {
 		/// Features that are known to the implementation, where a required feature is indicated by
 		/// its even bit and an optional feature is indicated by its odd bit.
@@ -50,8 +46,6 @@ mod sealed {
 	/// Defines a [`Context`] by stating which features it requires and which are optional. Features
 	/// are specified as a comma-separated list of bytes where each byte is a pipe-delimited list of
 	/// feature identifiers.
-	///
-	/// [`Context`]: trait.Context.html
 	macro_rules! define_context {
 		($context: ident {
 			required_features: [$( $( $required_feature: ident )|*, )*],
@@ -101,6 +95,8 @@ mod sealed {
 			StaticRemoteKey,
 			// Byte 2
 			,
+			// Byte 3
+			,
 		],
 		optional_features: [
 			// Byte 0
@@ -109,6 +105,8 @@ mod sealed {
 			VariableLengthOnion | PaymentSecret,
 			// Byte 2
 			BasicMPP,
+			// Byte 3
+			ShutdownAnySegwit,
 		],
 	});
 	define_context!(NodeContext {
@@ -119,6 +117,8 @@ mod sealed {
 			StaticRemoteKey,
 			// Byte 2
 			,
+			// Byte 3
+			,
 		],
 		optional_features: [
 			// Byte 0
@@ -127,19 +127,31 @@ mod sealed {
 			VariableLengthOnion | PaymentSecret,
 			// Byte 2
 			BasicMPP,
+			// Byte 3
+			ShutdownAnySegwit,
 		],
 	});
 	define_context!(ChannelContext {
 		required_features: [],
 		optional_features: [],
 	});
+	define_context!(InvoiceContext {
+		required_features: [,,,],
+		optional_features: [
+			// Byte 0
+			,
+			// Byte 1
+			VariableLengthOnion | PaymentSecret,
+			// Byte 2
+			BasicMPP,
+		],
+	});
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
 	/// useful for manipulating feature flags.
-	///
-	/// [`Context`]: trait.Context.html
 	macro_rules! define_feature {
-		($odd_bit: expr, $feature: ident, [$($context: ty),+], $doc: expr) => {
+		($odd_bit: expr, $feature: ident, [$($context: ty),+], $doc: expr, $optional_setter: ident,
+		 $required_setter: ident) => {
 			#[doc = $doc]
 			///
 			/// See [BOLT #9] for details.
@@ -224,6 +236,20 @@ mod sealed {
 				}
 			}
 
+			impl <T: $feature> Features<T> {
+				/// Set this feature as optional.
+				pub fn $optional_setter(mut self) -> Self {
+					<T as $feature>::set_optional_bit(&mut self.flags);
+					self
+				}
+
+				/// Set this feature as required.
+				pub fn $required_setter(mut self) -> Self {
+					<T as $feature>::set_required_bit(&mut self.flags);
+					self
+				}
+			}
+
 			$(
 				impl $feature for $context {
 					// EVEN_BIT % 2 == 0
@@ -233,26 +259,34 @@ mod sealed {
 					const ASSERT_ODD_BIT_PARITY: usize = (<Self as $feature>::ODD_BIT % 2) - 1;
 				}
 			)*
+
 		}
 	}
 
 	define_feature!(1, DataLossProtect, [InitContext, NodeContext],
-		"Feature flags for `option_data_loss_protect`.");
+		"Feature flags for `option_data_loss_protect`.", set_data_loss_protect_optional,
+		set_data_loss_protect_required);
 	// NOTE: Per Bolt #9, initial_routing_sync has no even bit.
-	define_feature!(3, InitialRoutingSync, [InitContext],
-		"Feature flags for `initial_routing_sync`.");
+	define_feature!(3, InitialRoutingSync, [InitContext], "Feature flags for `initial_routing_sync`.",
+		set_initial_routing_sync_optional, set_initial_routing_sync_required);
 	define_feature!(5, UpfrontShutdownScript, [InitContext, NodeContext],
-		"Feature flags for `option_upfront_shutdown_script`.");
+		"Feature flags for `option_upfront_shutdown_script`.", set_upfront_shutdown_script_optional,
+		set_upfront_shutdown_script_required);
 	define_feature!(7, GossipQueries, [InitContext, NodeContext],
-		"Feature flags for `gossip_queries`.");
-	define_feature!(9, VariableLengthOnion, [InitContext, NodeContext],
-		"Feature flags for `var_onion_optin`.");
+		"Feature flags for `gossip_queries`.", set_gossip_queries_optional, set_gossip_queries_required);
+	define_feature!(9, VariableLengthOnion, [InitContext, NodeContext, InvoiceContext],
+		"Feature flags for `var_onion_optin`.", set_variable_length_onion_optional,
+		set_variable_length_onion_required);
 	define_feature!(13, StaticRemoteKey, [InitContext, NodeContext],
-		"Feature flags for `option_static_remotekey`.");
-	define_feature!(15, PaymentSecret, [InitContext, NodeContext],
-		"Feature flags for `payment_secret`.");
-	define_feature!(17, BasicMPP, [InitContext, NodeContext],
-		"Feature flags for `basic_mpp`.");
+		"Feature flags for `option_static_remotekey`.", set_static_remote_key_optional,
+		set_static_remote_key_required);
+	define_feature!(15, PaymentSecret, [InitContext, NodeContext, InvoiceContext],
+		"Feature flags for `payment_secret`.", set_payment_secret_optional, set_payment_secret_required);
+	define_feature!(17, BasicMPP, [InitContext, NodeContext, InvoiceContext],
+		"Feature flags for `basic_mpp`.", set_basic_mpp_optional, set_basic_mpp_required);
+	define_feature!(27, ShutdownAnySegwit, [InitContext, NodeContext],
+		"Feature flags for `opt_shutdown_anysegwit`.", set_shutdown_any_segwit_optional,
+		set_shutdown_any_segwit_required);
 
 	#[cfg(test)]
 	define_context!(TestingContext {
@@ -276,7 +310,8 @@ mod sealed {
 
 	#[cfg(test)]
 	define_feature!(23, UnknownFeature, [TestingContext],
-		"Feature flags for an unknown feature used in testing.");
+		"Feature flags for an unknown feature used in testing.", set_unknown_feature_optional,
+		set_unknown_feature_required);
 }
 
 /// Tracks the set of features which a node implements, templated by the context in which it
@@ -314,6 +349,8 @@ pub type InitFeatures = Features<sealed::InitContext>;
 pub type NodeFeatures = Features<sealed::NodeContext>;
 /// Features used within a `channel_announcement` message.
 pub type ChannelFeatures = Features<sealed::ChannelContext>;
+/// Features used within an invoice.
+pub type InvoiceFeatures = Features<sealed::InvoiceContext>;
 
 impl InitFeatures {
 	/// Writes all features present up to, and including, 13.
@@ -350,19 +387,25 @@ impl InitFeatures {
 	}
 }
 
+impl InvoiceFeatures {
+	/// Converts `InvoiceFeatures` to `Features<C>`. Only known `InvoiceFeatures` relevant to
+	/// context `C` are included in the result.
+	pub(crate) fn to_context<C: sealed::Context>(&self) -> Features<C> {
+		self.to_context_internal()
+	}
+}
+
 impl<T: sealed::Context> Features<T> {
 	/// Create a blank Features with no features set
-	pub fn empty() -> Features<T> {
+	pub fn empty() -> Self {
 		Features {
 			flags: Vec::new(),
 			mark: PhantomData,
 		}
 	}
 
-	/// Creates features known by the implementation as defined by [`T::KNOWN_FEATURE_FLAGS`].
-	///
-	/// [`T::KNOWN_FEATURE_FLAGS`]: sealed/trait.Context.html#associatedconstant.KNOWN_FEATURE_FLAGS
-	pub fn known() -> Features<T> {
+	/// Creates a Features with the bits set which are known by the implementation
+	pub fn known() -> Self {
 		Self {
 			flags: T::KNOWN_FEATURE_FLAGS.to_vec(),
 			mark: PhantomData,
@@ -544,9 +587,19 @@ impl<T: sealed::BasicMPP> Features<T> {
 		<T as sealed::BasicMPP>::requires_feature(&self.flags)
 	}
 	// We currently never test for this since we don't actually *generate* multipath routes.
-	#[allow(dead_code)]
 	pub(crate) fn supports_basic_mpp(&self) -> bool {
 		<T as sealed::BasicMPP>::supports_feature(&self.flags)
+	}
+}
+
+impl<T: sealed::ShutdownAnySegwit> Features<T> {
+	pub(crate) fn supports_shutdown_anysegwit(&self) -> bool {
+		<T as sealed::ShutdownAnySegwit>::supports_feature(&self.flags)
+	}
+	#[cfg(test)]
+	pub(crate) fn clear_shutdown_anysegwit(mut self) -> Self {
+		<T as sealed::ShutdownAnySegwit>::clear_bits(&mut self.flags);
+		self
 	}
 }
 
@@ -574,7 +627,7 @@ impl<T: sealed::Context> Readable for Features<T> {
 
 #[cfg(test)]
 mod tests {
-	use super::{ChannelFeatures, InitFeatures, NodeFeatures};
+	use super::{ChannelFeatures, InitFeatures, InvoiceFeatures, NodeFeatures};
 
 	#[test]
 	fn sanity_test_known_features() {
@@ -620,6 +673,9 @@ mod tests {
 		assert!(!InitFeatures::known().requires_basic_mpp());
 		assert!(!NodeFeatures::known().requires_basic_mpp());
 
+		assert!(InitFeatures::known().supports_shutdown_anysegwit());
+		assert!(NodeFeatures::known().supports_shutdown_anysegwit());
+
 		let mut init_features = InitFeatures::known();
 		assert!(init_features.initial_routing_sync());
 		init_features.clear_initial_routing_sync();
@@ -658,10 +714,12 @@ mod tests {
 			// - option_data_loss_protect
 			// - var_onion_optin | static_remote_key (req) | payment_secret
 			// - basic_mpp
-			assert_eq!(node_features.flags.len(), 3);
+			// - opt_shutdown_anysegwit
+			assert_eq!(node_features.flags.len(), 4);
 			assert_eq!(node_features.flags[0], 0b00000010);
 			assert_eq!(node_features.flags[1], 0b10010010);
 			assert_eq!(node_features.flags[2], 0b00000010);
+			assert_eq!(node_features.flags[3], 0b00001000);
 		}
 
 		// Check that cleared flags are kept blank when converting back:
@@ -672,5 +730,16 @@ mod tests {
 		assert!(!features.initial_routing_sync());
 		assert!(!features.supports_upfront_shutdown_script());
 		assert!(!init_features.supports_gossip_queries());
+	}
+
+	#[test]
+	fn set_feature_bits() {
+		let features = InvoiceFeatures::empty()
+			.set_basic_mpp_optional()
+			.set_payment_secret_required();
+		assert!(features.supports_basic_mpp());
+		assert!(!features.requires_basic_mpp());
+		assert!(features.requires_payment_secret());
+		assert!(features.supports_payment_secret());
 	}
 }

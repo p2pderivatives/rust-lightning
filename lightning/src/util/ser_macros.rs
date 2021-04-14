@@ -7,9 +7,11 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+#[macro_export]
+/// Encode a tlv
 macro_rules! encode_tlv {
 	($stream: expr, {$(($type: expr, $field: expr)),*}) => { {
-		use util::ser::{BigSize, LengthCalculatingWriter};
+		use $crate::util::ser::{BigSize, LengthCalculatingWriter};
 		$(
 			BigSize($type).write($stream)?;
 			let mut len_calc = LengthCalculatingWriter(0);
@@ -20,9 +22,11 @@ macro_rules! encode_tlv {
 	} }
 }
 
+#[macro_export]
+/// Encode a tlv with a varint length prefixed
 macro_rules! encode_varint_length_prefixed_tlv {
 	($stream: expr, {$(($type: expr, $field: expr)),*}) => { {
-		use util::ser::{BigSize, LengthCalculatingWriter};
+		use $crate::util::ser::{BigSize, LengthCalculatingWriter};
 		let mut len = LengthCalculatingWriter(0);
 		{
 			$(
@@ -41,19 +45,21 @@ macro_rules! encode_varint_length_prefixed_tlv {
 	} }
 }
 
+#[macro_export]
+/// Decode a tlv
 macro_rules! decode_tlv {
 	($stream: expr, {$(($reqtype: expr, $reqfield: ident)),*}, {$(($type: expr, $field: ident)),*}) => { {
-		use ln::msgs::DecodeError;
+		use $crate::ln::msgs::DecodeError;
 		let mut last_seen_type: Option<u64> = None;
 		'tlv_read: loop {
-			use util::ser;
+			use $crate::util::ser;
 
 			// First decode the type of this TLV:
 			let typ: ser::BigSize = {
 				// We track whether any bytes were read during the consensus_decode call to
 				// determine whether we should break or return ShortRead if we get an
 				// UnexpectedEof. This should in every case be largely cosmetic, but its nice to
-				// pass the TLV test vectors exactly, which requre this distinction.
+				// pass the TLV test vectors exactly, which requires this distinction.
 				let mut tracking_reader = ser::ReadTrackingReader::new($stream);
 				match ser::Readable::read(&mut tracking_reader) {
 					Err(DecodeError::ShortRead) => {
@@ -84,26 +90,29 @@ macro_rules! decode_tlv {
 			// Finally, read the length and value itself:
 			let length: ser::BigSize = Readable::read($stream)?;
 			let mut s = ser::FixedLengthReader::new($stream, length.0);
-			match typ.0 {
-				$($reqtype => {
-					$reqfield = ser::Readable::read(&mut s)?;
-					if s.bytes_remain() {
-						s.eat_remaining()?; // Return ShortRead if there's actually not enough bytes
-						Err(DecodeError::InvalidValue)?
+			loop {
+					$(if typ.0 == $reqtype {
+						$reqfield = ser::Readable::read(&mut s)?;
+						if s.bytes_remain() {
+							s.eat_remaining()?; // Return ShortRead if there's actually not enough bytes
+							Err(DecodeError::InvalidValue)?
+						}
+						break;
+					})*
+					$(if typ.0 == $type {
+						$field = Some(ser::Readable::read(&mut s)?);
+						if s.bytes_remain() {
+							s.eat_remaining()?; // Return ShortRead if there's actually not enough bytes
+							Err(DecodeError::InvalidValue)?
+						}
+						break;
+					})*
+					let x = typ.0;
+					if  x % 2 == 0 {
+						Err(DecodeError::UnknownRequiredFeature)?
 					}
-				},)*
-				$($type => {
-					$field = Some(ser::Readable::read(&mut s)?);
-					if s.bytes_remain() {
-						s.eat_remaining()?; // Return ShortRead if there's actually not enough bytes
-						Err(DecodeError::InvalidValue)?
-					}
-				},)*
-				x if x % 2 == 0 => {
-					Err(DecodeError::UnknownRequiredFeature)?
-				},
-				_ => {},
-			}
+					break;
+		    }
 			s.eat_remaining()?;
 		}
 		// Make sure we got to each required type after we've read every TLV:

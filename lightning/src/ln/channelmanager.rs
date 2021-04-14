@@ -18,7 +18,7 @@
 //! imply it needs to fail HTLCs/payments/channels it manages).
 //!
 
-use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::blockdata::block::{Block, BlockHeader};
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::network::constants::Network;
 
@@ -39,6 +39,9 @@ use chain::Watch;
 use chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, ChannelMonitorUpdateErr, HTLC_FAIL_BACK_BUFFER, CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, ANTI_REORG_DELAY, MonitorEvent, CLOSED_CHANNEL_UPDATE_ID};
 use chain::transaction::{OutPoint, TransactionData};
+// Since this struct is returned in `list_channels` methods, expose it here in case users want to
+// construct one themselves.
+pub use ln::channel::CounterpartyForwardingInfo;
 use ln::channel::{Channel, ChannelError};
 use ln::features::{InitFeatures, NodeFeatures};
 use routing::router::{Route, RouteHop};
@@ -46,7 +49,7 @@ use ln::msgs;
 use ln::msgs::NetAddress;
 use ln::onion_utils;
 use ln::msgs::{ChannelMessageHandler, DecodeError, LightningError, OptionalField};
-use chain::keysinterface::{ChannelKeys, KeysInterface, KeysManager, InMemoryChannelKeys};
+use chain::keysinterface::{Sign, KeysInterface, KeysManager, InMemorySigner};
 use util::config::UserConfig;
 use util::events::{Event, EventsProvider, MessageSendEvent, MessageSendEventsProvider};
 use util::{byte_utils, events};
@@ -58,9 +61,11 @@ use util::errors::APIError;
 use std::{cmp, mem};
 use std::collections::{HashMap, hash_map, HashSet};
 use std::io::{Cursor, Read};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+#[cfg(any(test, feature = "allow_wallclock_use"))]
+use std::time::Instant;
 use std::marker::{Sync, Send};
 use std::ops::Deref;
 use bitcoin::hashes::hex::ToHex;
@@ -204,7 +209,7 @@ pub struct PaymentPreimage(pub [u8;32]);
 #[derive(Hash, Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PaymentSecret(pub [u8;32]);
 
-type ShutdownResult = (Option<OutPoint>, ChannelMonitorUpdate, Vec<(HTLCSource, PaymentHash)>);
+type ShutdownResult = (Option<(OutPoint, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>);
 
 /// Error type returned across the channel_state mutex boundary. When an Err is generated for a
 /// Channel, we generally end up with a ChannelError::Close for which we have to close the channel
@@ -312,8 +317,8 @@ pub(super) enum RAACommitmentOrder {
 }
 
 // Note this is only exposed in cfg(test):
-pub(super) struct ChannelHolder<ChanSigner: ChannelKeys> {
-	pub(super) by_id: HashMap<[u8; 32], Channel<ChanSigner>>,
+pub(super) struct ChannelHolder<Signer: Sign> {
+	pub(super) by_id: HashMap<[u8; 32], Channel<Signer>>,
 	pub(super) short_to_id: HashMap<u64, [u8; 32]>,
 	/// short channel id -> forward infos. Key of 0 means payments received
 	/// Note that while this is held in the same mutex as the channels themselves, no consistency
@@ -329,6 +334,15 @@ pub(super) struct ChannelHolder<ChanSigner: ChannelKeys> {
 	/// Messages to send to peers - pushed to in the same lock that they are generated in (except
 	/// for broadcast messages, where ordering isn't as strict).
 	pub(super) pending_msg_events: Vec<MessageSendEvent>,
+}
+
+/// Events which we process internally but cannot be procsesed immediately at the generation site
+/// for some reason. They are handled in timer_chan_freshness_every_min, so may be processed with
+/// quite some time lag.
+enum BackgroundEvent {
+	/// Handle a ChannelMonitorUpdate that closes a channel, broadcasting its current latest holder
+	/// commitment transaction.
+	ClosingMonitorUpdate((OutPoint, ChannelMonitorUpdate)),
 }
 
 /// State we hold per-peer. In the future we should put channels in here, but for now we only hold
@@ -347,7 +361,7 @@ const ERR: () = "You need at least 32 bit pointers (well, usize, but we'll assum
 /// issues such as overly long function definitions. Note that the ChannelManager can take any
 /// type that implements KeysInterface for its keys manager, but this type alias chooses the
 /// concrete type of the KeysManager.
-pub type SimpleArcChannelManager<M, T, F, L> = Arc<ChannelManager<InMemoryChannelKeys, Arc<M>, Arc<T>, Arc<KeysManager>, Arc<F>, Arc<L>>>;
+pub type SimpleArcChannelManager<M, T, F, L> = ChannelManager<InMemorySigner, Arc<M>, Arc<T>, Arc<KeysManager>, Arc<F>, Arc<L>>;
 
 /// SimpleRefChannelManager is a type alias for a ChannelManager reference, and is the reference
 /// counterpart to the SimpleArcChannelManager type alias. Use this type by default when you don't
@@ -357,7 +371,7 @@ pub type SimpleArcChannelManager<M, T, F, L> = Arc<ChannelManager<InMemoryChanne
 /// helps with issues such as long function definitions. Note that the ChannelManager can take any
 /// type that implements KeysInterface for its keys manager, but this type alias chooses the
 /// concrete type of the KeysManager.
-pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, M, T, F, L> = ChannelManager<InMemoryChannelKeys, &'a M, &'b T, &'c KeysManager, &'d F, &'e L>;
+pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, M, T, F, L> = ChannelManager<InMemorySigner, &'a M, &'b T, &'c KeysManager, &'d F, &'e L>;
 
 /// Manager which keeps track of a number of channels and sends messages to the appropriate
 /// channel, also tracking HTLC preimages and forwarding onion packets appropriately.
@@ -378,7 +392,7 @@ pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, M, T, F, L> = ChannelManage
 /// ChannelMonitors passed by reference to read(), those channels will be force-closed based on the
 /// ChannelMonitor state and no funds will be lost (mod on-chain transaction fees).
 ///
-/// Note that the deserializer is only implemented for (Sha256dHash, ChannelManager), which
+/// Note that the deserializer is only implemented for (BlockHash, ChannelManager), which
 /// tells you the last block hash which was block_connect()ed. You MUST rescan any blocks along
 /// the "reorg path" (ie call block_disconnected() until you get to a common block and then call
 /// block_connected() to step towards your best block) upon deserialization before using the
@@ -395,10 +409,10 @@ pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, M, T, F, L> = ChannelManage
 /// essentially you should default to using a SimpleRefChannelManager, and use a
 /// SimpleArcChannelManager when you require a ChannelManager with a static lifetime, such as when
 /// you're using lightning-net-tokio.
-pub struct ChannelManager<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+pub struct ChannelManager<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
 				L::Target: Logger,
 {
@@ -412,14 +426,15 @@ pub struct ChannelManager<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref,
 	pub(super) latest_block_height: AtomicUsize,
 	#[cfg(not(test))]
 	latest_block_height: AtomicUsize,
-	last_block_hash: Mutex<BlockHash>,
+	last_block_hash: RwLock<BlockHash>,
 	secp_ctx: Secp256k1<secp256k1::All>,
 
 	#[cfg(any(test, feature = "_test_utils"))]
-	pub(super) channel_state: Mutex<ChannelHolder<ChanSigner>>,
+	pub(super) channel_state: Mutex<ChannelHolder<Signer>>,
 	#[cfg(not(any(test, feature = "_test_utils")))]
-	channel_state: Mutex<ChannelHolder<ChanSigner>>,
+	channel_state: Mutex<ChannelHolder<Signer>>,
 	our_network_key: SecretKey,
+	our_network_pubkey: PublicKey,
 
 	/// Used to track the last value sent in a node_announcement "timestamp" field. We ensure this
 	/// value increases strictly since we don't assume access to a time source.
@@ -434,28 +449,91 @@ pub struct ChannelManager<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref,
 	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
 
 	pending_events: Mutex<Vec<events::Event>>,
+	pending_background_events: Mutex<Vec<BackgroundEvent>>,
 	/// Used when we have to take a BIG lock to make sure everything is self-consistent.
 	/// Essentially just when we're serializing ourselves out.
 	/// Taken first everywhere where we are making changes before any other locks.
+	/// When acquiring this lock in read mode, rather than acquiring it directly, call
+	/// `PersistenceNotifierGuard::new(..)` and pass the lock to it, to ensure the PersistenceNotifier
+	/// the lock contains sends out a notification when the lock is released.
 	total_consistency_lock: RwLock<()>,
+
+	persistence_notifier: PersistenceNotifier,
 
 	keys_manager: K,
 
 	logger: L,
 }
 
-/// The amount of time we require our counterparty wait to claim their money (ie time between when
-/// we, or our watchtower, must check for them having broadcast a theft transaction).
-pub(crate) const BREAKDOWN_TIMEOUT: u16 = 6 * 24;
-/// The amount of time we're willing to wait to claim money back to us
-pub(crate) const MAX_LOCAL_BREAKDOWN_TIMEOUT: u16 = 6 * 24 * 7;
+/// Chain-related parameters used to construct a new `ChannelManager`.
+///
+/// Typically, the block-specific parameters are derived from the best block hash for the network,
+/// as a newly constructed `ChannelManager` will not have created any channels yet. These parameters
+/// are not needed when deserializing a previously constructed `ChannelManager`.
+pub struct ChainParameters {
+	/// The network for determining the `chain_hash` in Lightning messages.
+	pub network: Network,
+
+	/// The hash of the latest block successfully connected.
+	pub latest_hash: BlockHash,
+
+	/// The height of the latest block successfully connected.
+	///
+	/// Used to track on-chain channel funding outputs and send payments with reliable timelocks.
+	pub latest_height: usize,
+}
+
+/// Whenever we release the `ChannelManager`'s `total_consistency_lock`, from read mode, it is
+/// desirable to notify any listeners on `await_persistable_update_timeout`/
+/// `await_persistable_update` that new updates are available for persistence. Therefore, this
+/// struct is responsible for locking the total consistency lock and, upon going out of scope,
+/// sending the aforementioned notification (since the lock being released indicates that the
+/// updates are ready for persistence).
+struct PersistenceNotifierGuard<'a> {
+	persistence_notifier: &'a PersistenceNotifier,
+	// We hold onto this result so the lock doesn't get released immediately.
+	_read_guard: RwLockReadGuard<'a, ()>,
+}
+
+impl<'a> PersistenceNotifierGuard<'a> {
+	fn new(lock: &'a RwLock<()>, notifier: &'a PersistenceNotifier) -> Self {
+		let read_guard = lock.read().unwrap();
+
+		Self {
+			persistence_notifier: notifier,
+			_read_guard: read_guard,
+		}
+	}
+}
+
+impl<'a> Drop for PersistenceNotifierGuard<'a> {
+	fn drop(&mut self) {
+		self.persistence_notifier.notify();
+	}
+}
+
+/// The amount of time in blocks we require our counterparty wait to claim their money (ie time
+/// between when we, or our watchtower, must check for them having broadcast a theft transaction).
+///
+/// This can be increased (but not decreased) through [`ChannelHandshakeConfig::our_to_self_delay`]
+///
+/// [`ChannelHandshakeConfig::our_to_self_delay`]: crate::util::config::ChannelHandshakeConfig::our_to_self_delay
+pub const BREAKDOWN_TIMEOUT: u16 = 6 * 24;
+/// The amount of time in blocks we're willing to wait to claim money back to us. This matches
+/// the maximum required amount in lnd as of March 2021.
+pub(crate) const MAX_LOCAL_BREAKDOWN_TIMEOUT: u16 = 2 * 6 * 24 * 7;
 
 /// The minimum number of blocks between an inbound HTLC's CLTV and the corresponding outbound
-/// HTLC's CLTV. This should always be a few blocks greater than channelmonitor::CLTV_CLAIM_BUFFER,
-/// ie the node we forwarded the payment on to should always have enough room to reliably time out
-/// the HTLC via a full update_fail_htlc/commitment_signed dance before we hit the
-/// CLTV_CLAIM_BUFFER point (we static assert that it's at least 3 blocks more).
-const CLTV_EXPIRY_DELTA: u16 = 6 * 12; //TODO?
+/// HTLC's CLTV. The current default represents roughly six hours of blocks at six blocks/hour.
+///
+/// This can be increased (but not decreased) through [`ChannelConfig::cltv_expiry_delta`]
+///
+/// [`ChannelConfig::cltv_expiry_delta`]: crate::util::config::ChannelConfig::cltv_expiry_delta
+// This should always be a few blocks greater than channelmonitor::CLTV_CLAIM_BUFFER,
+// i.e. the node we forwarded the payment on to should always have enough room to reliably time out
+// the HTLC via a full update_fail_htlc/commitment_signed dance before we hit the
+// CLTV_CLAIM_BUFFER point (we static assert that it's at least 3 blocks more).
+pub const MIN_CLTV_EXPIRY_DELTA: u16 = 6 * 6;
 pub(super) const CLTV_FAR_FAR_AWAY: u32 = 6 * 24 * 7; //TODO?
 
 // Check that our CLTV_EXPIRY is at least CLTV_CLAIM_BUFFER + ANTI_REORG_DELAY + LATENCY_GRACE_PERIOD_BLOCKS,
@@ -466,13 +544,13 @@ pub(super) const CLTV_FAR_FAR_AWAY: u32 = 6 * 24 * 7; //TODO?
 // LATENCY_GRACE_PERIOD_BLOCKS.
 #[deny(const_err)]
 #[allow(dead_code)]
-const CHECK_CLTV_EXPIRY_SANITY: u32 = CLTV_EXPIRY_DELTA as u32 - LATENCY_GRACE_PERIOD_BLOCKS - CLTV_CLAIM_BUFFER - ANTI_REORG_DELAY - LATENCY_GRACE_PERIOD_BLOCKS;
+const CHECK_CLTV_EXPIRY_SANITY: u32 = MIN_CLTV_EXPIRY_DELTA as u32 - LATENCY_GRACE_PERIOD_BLOCKS - CLTV_CLAIM_BUFFER - ANTI_REORG_DELAY - LATENCY_GRACE_PERIOD_BLOCKS;
 
 // Check for ability of an attacker to make us fail on-chain by delaying inbound claim. See
 // ChannelMontior::would_broadcast_at_height for a description of why this is needed.
 #[deny(const_err)]
 #[allow(dead_code)]
-const CHECK_CLTV_EXPIRY_SANITY_2: u32 = CLTV_EXPIRY_DELTA as u32 - LATENCY_GRACE_PERIOD_BLOCKS - 2*CLTV_CLAIM_BUFFER;
+const CHECK_CLTV_EXPIRY_SANITY_2: u32 = MIN_CLTV_EXPIRY_DELTA as u32 - LATENCY_GRACE_PERIOD_BLOCKS - 2*CLTV_CLAIM_BUFFER;
 
 /// Details of a channel, as returned by ChannelManager::list_channels and ChannelManager::list_usable_channels
 #[derive(Clone)]
@@ -509,12 +587,16 @@ pub struct ChannelDetails {
 	/// True if the channel is (a) confirmed and funding_locked messages have been exchanged, (b)
 	/// the peer is connected, and (c) no monitor update failure is pending resolution.
 	pub is_live: bool,
+
+	/// Information on the fees and requirements that the counterparty requires when forwarding
+	/// payments to us through this channel.
+	pub counterparty_forwarding_info: Option<CounterpartyForwardingInfo>,
 }
 
 /// If a payment fails to send, it can be in one of several states. This enum is returned as the
 /// Err() type describing which state the payment is in, see the description of individual enum
 /// states for more.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PaymentSendFailure {
 	/// A parameter which was passed to send_payment was invalid, preventing us from attempting to
 	/// send the payment at all. No channel state has been changed or messages sent to peers, and
@@ -709,10 +791,10 @@ macro_rules! maybe_break_monitor_err {
 	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
@@ -725,24 +807,22 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	///
 	/// panics if channel_value_satoshis is >= `MAX_FUNDING_SATOSHIS`!
 	///
-	/// Users must provide the current blockchain height from which to track onchain channel
-	/// funding outpoints and send payments with reliable timelocks.
-	///
 	/// Users need to notify the new ChannelManager when a new block is connected or
-	/// disconnected using its `block_connected` and `block_disconnected` methods.
-	pub fn new(network: Network, fee_est: F, chain_monitor: M, tx_broadcaster: T, logger: L, keys_manager: K, config: UserConfig, current_blockchain_height: usize) -> Self {
-		let secp_ctx = Secp256k1::new();
+	/// disconnected using its `block_connected` and `block_disconnected` methods, starting
+	/// from after `params.latest_hash`.
+	pub fn new(fee_est: F, chain_monitor: M, tx_broadcaster: T, logger: L, keys_manager: K, config: UserConfig, params: ChainParameters) -> Self {
+		let mut secp_ctx = Secp256k1::new();
+		secp_ctx.seeded_randomize(&keys_manager.get_secure_random_bytes());
 
 		ChannelManager {
 			default_configuration: config.clone(),
-			genesis_hash: genesis_block(network).header.block_hash(),
+			genesis_hash: genesis_block(params.network).header.block_hash(),
 			fee_estimator: fee_est,
 			chain_monitor,
 			tx_broadcaster,
 
-			latest_block_height: AtomicUsize::new(current_blockchain_height),
-			last_block_hash: Mutex::new(Default::default()),
-			secp_ctx,
+			latest_block_height: AtomicUsize::new(params.latest_height),
+			last_block_hash: RwLock::new(params.latest_hash),
 
 			channel_state: Mutex::new(ChannelHolder{
 				by_id: HashMap::new(),
@@ -752,13 +832,17 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 				pending_msg_events: Vec::new(),
 			}),
 			our_network_key: keys_manager.get_node_secret(),
+			our_network_pubkey: PublicKey::from_secret_key(&secp_ctx, &keys_manager.get_node_secret()),
+			secp_ctx,
 
 			last_node_announcement_serial: AtomicUsize::new(0),
 
 			per_peer_state: RwLock::new(HashMap::new()),
 
 			pending_events: Mutex::new(Vec::new()),
+			pending_background_events: Mutex::new(Vec::new()),
 			total_consistency_lock: RwLock::new(()),
+			persistence_notifier: PersistenceNotifier::new(),
 
 			keys_manager,
 
@@ -787,7 +871,10 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		let channel = Channel::new_outbound(&self.fee_estimator, &self.keys_manager, their_network_key, channel_value_satoshis, push_msat, user_id, config)?;
 		let res = channel.get_open_channel(self.genesis_hash.clone());
 
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+		// We want to make sure the lock is actually acquired by PersistenceNotifierGuard.
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
 		let mut channel_state = self.channel_state.lock().unwrap();
 		match channel_state.by_id.entry(channel.channel_id()) {
 			hash_map::Entry::Occupied(_) => {
@@ -806,7 +893,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		Ok(())
 	}
 
-	fn list_channels_with_filter<Fn: FnMut(&(&[u8; 32], &Channel<ChanSigner>)) -> bool>(&self, f: Fn) -> Vec<ChannelDetails> {
+	fn list_channels_with_filter<Fn: FnMut(&(&[u8; 32], &Channel<Signer>)) -> bool>(&self, f: Fn) -> Vec<ChannelDetails> {
 		let mut res = Vec::new();
 		{
 			let channel_state = self.channel_state.lock().unwrap();
@@ -823,6 +910,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					outbound_capacity_msat,
 					user_id: channel.get_user_id(),
 					is_live: channel.is_live(),
+					counterparty_forwarding_info: channel.counterparty_forwarding_info(),
 				});
 			}
 		}
@@ -859,7 +947,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	///
 	/// May generate a SendShutdown message event on success, which should be relayed.
 	pub fn close_channel(&self, channel_id: &[u8; 32]) -> Result<(), APIError> {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let (mut failed_htlcs, chan_option) = {
 			let mut channel_state_lock = self.channel_state.lock().unwrap();
@@ -902,12 +990,12 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 	#[inline]
 	fn finish_force_close_channel(&self, shutdown_res: ShutdownResult) {
-		let (funding_txo_option, monitor_update, mut failed_htlcs) = shutdown_res;
+		let (monitor_update_option, mut failed_htlcs) = shutdown_res;
 		log_trace!(self.logger, "Finishing force-closure of channel {} HTLCs to fail", failed_htlcs.len());
 		for htlc_source in failed_htlcs.drain(..) {
 			self.fail_htlc_backwards_internal(self.channel_state.lock().unwrap(), htlc_source.0, &htlc_source.1, HTLCFailReason::Reason { failure_code: 0x4000 | 8, data: Vec::new() });
 		}
-		if let Some(funding_txo) = funding_txo_option {
+		if let Some((funding_txo, monitor_update)) = monitor_update_option {
 			// There isn't anything we can do if we get an update failure - we're already
 			// force-closing. The monitor update on the required in-memory copy should broadcast
 			// the latest local state, which is the best we can do anyway. Thus, it is safe to
@@ -916,21 +1004,24 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		}
 	}
 
-	/// Force closes a channel, immediately broadcasting the latest local commitment transaction to
-	/// the chain and rejecting new HTLCs on the given channel.
-	pub fn force_close_channel(&self, channel_id: &[u8; 32]) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
-
+	fn force_close_channel_with_peer(&self, channel_id: &[u8; 32], peer_node_id: Option<&PublicKey>) -> Result<(), APIError> {
 		let mut chan = {
 			let mut channel_state_lock = self.channel_state.lock().unwrap();
 			let channel_state = &mut *channel_state_lock;
-			if let Some(chan) = channel_state.by_id.remove(channel_id) {
-				if let Some(short_id) = chan.get_short_channel_id() {
+			if let hash_map::Entry::Occupied(chan) = channel_state.by_id.entry(channel_id.clone()) {
+				if let Some(node_id) = peer_node_id {
+					if chan.get().get_counterparty_node_id() != *node_id {
+						// Error or Ok here doesn't matter - the result is only exposed publicly
+						// when peer_node_id is None anyway.
+						return Ok(());
+					}
+				}
+				if let Some(short_id) = chan.get().get_short_channel_id() {
 					channel_state.short_to_id.remove(&short_id);
 				}
-				chan
+				chan.remove_entry().1
 			} else {
-				return;
+				return Err(APIError::ChannelUnavailable{err: "No such channel".to_owned()});
 			}
 		};
 		log_trace!(self.logger, "Force-closing channel {}", log_bytes!(channel_id[..]));
@@ -941,17 +1032,26 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 				msg: update
 			});
 		}
+
+		Ok(())
+	}
+
+	/// Force closes a channel, immediately broadcasting the latest local commitment transaction to
+	/// the chain and rejecting new HTLCs on the given channel. Fails if channel_id is unknown to the manager.
+	pub fn force_close_channel(&self, channel_id: &[u8; 32]) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+		self.force_close_channel_with_peer(channel_id, None)
 	}
 
 	/// Force close all channels, immediately broadcasting the latest local commitment transaction
 	/// for each to the chain and rejecting new HTLCs on each.
 	pub fn force_close_all_channels(&self) {
 		for chan in self.list_channels() {
-			self.force_close_channel(&chan.channel_id);
+			let _ = self.force_close_channel(&chan.channel_id);
 		}
 	}
 
-	fn decode_update_add_htlc_onion(&self, msg: &msgs::UpdateAddHTLC) -> (PendingHTLCStatus, MutexGuard<ChannelHolder<ChanSigner>>) {
+	fn decode_update_add_htlc_onion(&self, msg: &msgs::UpdateAddHTLC) -> (PendingHTLCStatus, MutexGuard<ChannelHolder<Signer>>) {
 		macro_rules! return_malformed_err {
 			($msg: expr, $err_code: expr) => {
 				{
@@ -1178,7 +1278,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					if fee.is_none() || msg.amount_msat < fee.unwrap() || (msg.amount_msat - fee.unwrap()) < *amt_to_forward { // fee_insufficient
 						break Some(("Prior hop has deviated from specified fees parameters or origin node has obsolete ones", 0x1000 | 12, Some(self.get_channel_update(chan).unwrap())));
 					}
-					if (msg.cltv_expiry as u64) < (*outgoing_cltv_value) as u64 + CLTV_EXPIRY_DELTA as u64 { // incorrect_cltv_expiry
+					if (msg.cltv_expiry as u64) < (*outgoing_cltv_value) as u64 + chan.get_cltv_expiry_delta() as u64 { // incorrect_cltv_expiry
 						break Some(("Forwarding node has tampered with the intended HTLC values or origin node has an obsolete cltv_expiry_delta", 0x1000 | 13, Some(self.get_channel_update(chan).unwrap())));
 					}
 					let cur_height = self.latest_block_height.load(Ordering::Acquire) as u32 + 1;
@@ -1223,7 +1323,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 	/// only fails if the channel does not yet have an assigned short_id
 	/// May be called with channel_state already locked!
-	fn get_channel_update(&self, chan: &Channel<ChanSigner>) -> Result<msgs::ChannelUpdate, LightningError> {
+	fn get_channel_update(&self, chan: &Channel<Signer>) -> Result<msgs::ChannelUpdate, LightningError> {
 		let short_channel_id = match chan.get_short_channel_id() {
 			None => return Err(LightningError{err: "Channel not yet established".to_owned(), action: msgs::ErrorAction::IgnoreError}),
 			Some(id) => id,
@@ -1236,7 +1336,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 			short_channel_id,
 			timestamp: chan.get_update_time_counter(),
 			flags: (!were_node_one) as u8 | ((!chan.is_live() as u8) << 1),
-			cltv_expiry_delta: CLTV_EXPIRY_DELTA,
+			cltv_expiry_delta: chan.get_cltv_expiry_delta(),
 			htlc_minimum_msat: chan.get_counterparty_htlc_minimum_msat(),
 			htlc_maximum_msat: OptionalField::Present(chan.get_announced_htlc_max_msat()),
 			fee_base_msat: chan.get_holder_fee_base_msat(&self.fee_estimator),
@@ -1267,7 +1367,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		}
 		let onion_packet = onion_utils::construct_onion_packet(onion_payloads, onion_keys, prng_seed, payment_hash);
 
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let err: Result<(), _> = loop {
 			let mut channel_lock = self.channel_state.lock().unwrap();
@@ -1435,7 +1535,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// May panic if the funding_txo is duplicative with some other channel (note that this should
 	/// be trivially prevented by using unique funding transaction keys per-channel).
 	pub fn funding_transaction_generated(&self, temporary_channel_id: &[u8; 32], funding_txo: OutPoint) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let (chan, msg) = {
 			let (res, chan) = match self.channel_state.lock().unwrap().by_id.remove(temporary_channel_id) {
@@ -1471,7 +1571,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		}
 	}
 
-	fn get_announcement_sigs(&self, chan: &Channel<ChanSigner>) -> Option<msgs::AnnouncementSignatures> {
+	fn get_announcement_sigs(&self, chan: &Channel<Signer>) -> Option<msgs::AnnouncementSignatures> {
 		if !chan.should_announce() {
 			log_trace!(self.logger, "Can't send announcement_signatures for private channel {}", log_bytes!(chan.channel_id()));
 			return None
@@ -1518,7 +1618,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	///
 	/// Panics if addresses is absurdly large (more than 500).
 	pub fn broadcast_node_announcement(&self, rgb: [u8; 3], alias: [u8; 32], addresses: Vec<NetAddress>) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		if addresses.len() > 500 {
 			panic!("More than half the message size was taken up by public addresses!");
@@ -1548,7 +1648,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// Should only really ever be called in response to a PendingHTLCsForwardable event.
 	/// Will likely generate further events.
 	pub fn process_pending_htlc_forwards(&self) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let mut new_events = Vec::new();
 		let mut failed_forwards = Vec::new();
@@ -1802,13 +1902,42 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		events.append(&mut new_events);
 	}
 
+	/// Free the background events, generally called from timer_chan_freshness_every_min.
+	///
+	/// Exposed for testing to allow us to process events quickly without generating accidental
+	/// BroadcastChannelUpdate events in timer_chan_freshness_every_min.
+	///
+	/// Expects the caller to have a total_consistency_lock read lock.
+	fn process_background_events(&self) {
+		let mut background_events = Vec::new();
+		mem::swap(&mut *self.pending_background_events.lock().unwrap(), &mut background_events);
+		for event in background_events.drain(..) {
+			match event {
+				BackgroundEvent::ClosingMonitorUpdate((funding_txo, update)) => {
+					// The channel has already been closed, so no use bothering to care about the
+					// monitor updating completing.
+					let _ = self.chain_monitor.update_channel(funding_txo, update);
+				},
+			}
+		}
+	}
+
+	#[cfg(any(test, feature = "_test_utils"))]
+	pub(crate) fn test_process_background_events(&self) {
+		self.process_background_events();
+	}
+
 	/// If a peer is disconnected we mark any channels with that peer as 'disabled'.
 	/// After some time, if channels are still disabled we need to broadcast a ChannelUpdate
 	/// to inform the network about the uselessness of these channels.
 	///
 	/// This method handles all the details, and must be called roughly once per minute.
+	///
+	/// Note that in some rare cases this may generate a `chain::Watch::update_channel` call.
 	pub fn timer_chan_freshness_every_min(&self) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+		self.process_background_events();
+
 		let mut channel_state_lock = self.channel_state.lock().unwrap();
 		let channel_state = &mut *channel_state_lock;
 		for (_, chan) in channel_state.by_id.iter_mut() {
@@ -1833,7 +1962,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// Returns false if no payment was found to fail backwards, true if the process of failing the
 	/// HTLC backwards has been started.
 	pub fn fail_htlc_backwards(&self, payment_hash: &PaymentHash, payment_secret: &Option<PaymentSecret>) -> bool {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let mut channel_state = Some(self.channel_state.lock().unwrap());
 		let removed_source = channel_state.as_mut().unwrap().claimable_htlcs.remove(&(*payment_hash, *payment_secret));
@@ -1896,11 +2025,15 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// to fail and take the channel_state lock for each iteration (as we take ownership and may
 	/// drop it). In other words, no assumptions are made that entries in claimable_htlcs point to
 	/// still-available channels.
-	fn fail_htlc_backwards_internal(&self, mut channel_state_lock: MutexGuard<ChannelHolder<ChanSigner>>, source: HTLCSource, payment_hash: &PaymentHash, onion_error: HTLCFailReason) {
+	fn fail_htlc_backwards_internal(&self, mut channel_state_lock: MutexGuard<ChannelHolder<Signer>>, source: HTLCSource, payment_hash: &PaymentHash, onion_error: HTLCFailReason) {
 		//TODO: There is a timing attack here where if a node fails an HTLC back to us they can
 		//identify whether we sent it or not based on the (I presume) very different runtime
 		//between the branches here. We should make this async and move it into the forward HTLCs
 		//timer handling.
+
+		// Note that we MUST NOT end up calling methods on self.chain_monitor here - we're called
+		// from block_connected which may run during initialization prior to the chain_monitor
+		// being fully configured. See the docs for `ChannelManagerReadArgs` for more.
 		match source {
 			HTLCSource::OutboundRoute { ref path, .. } => {
 				log_trace!(self.logger, "Failing outbound payment HTLC with payment_hash {}", log_bytes!(payment_hash.0));
@@ -2012,7 +2145,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	pub fn claim_funds(&self, payment_preimage: PaymentPreimage, payment_secret: &Option<PaymentSecret>, expected_amount: u64) -> bool {
 		let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0).into_inner());
 
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let mut channel_state = Some(self.channel_state.lock().unwrap());
 		let removed_source = channel_state.as_mut().unwrap().claimable_htlcs.remove(&(payment_hash, *payment_secret));
@@ -2090,7 +2223,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		} else { false }
 	}
 
-	fn claim_funds_from_hop(&self, channel_state_lock: &mut MutexGuard<ChannelHolder<ChanSigner>>, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage) -> Result<(), Option<(PublicKey, MsgHandleErrInternal)>> {
+	fn claim_funds_from_hop(&self, channel_state_lock: &mut MutexGuard<ChannelHolder<Signer>>, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage) -> Result<(), Option<(PublicKey, MsgHandleErrInternal)>> {
 		//TODO: Delay the claimed_funds relaying just like we do outbound relay!
 		let channel_state = &mut **channel_state_lock;
 		let chan_id = match channel_state.short_to_id.get(&prev_hop.short_channel_id) {
@@ -2143,7 +2276,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		} else { unreachable!(); }
 	}
 
-	fn claim_funds_internal(&self, mut channel_state_lock: MutexGuard<ChannelHolder<ChanSigner>>, source: HTLCSource, payment_preimage: PaymentPreimage) {
+	fn claim_funds_internal(&self, mut channel_state_lock: MutexGuard<ChannelHolder<Signer>>, source: HTLCSource, payment_preimage: PaymentPreimage) {
 		match source {
 			HTLCSource::OutboundRoute { .. } => {
 				mem::drop(channel_state_lock);
@@ -2184,7 +2317,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 	/// Gets the node_id held by this ChannelManager
 	pub fn get_our_node_id(&self) -> PublicKey {
-		PublicKey::from_secret_key(&self.secp_ctx, &self.our_network_key)
+		self.our_network_pubkey.clone()
 	}
 
 	/// Restores a single, given channel to normal operation after a
@@ -2208,7 +2341,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	///  4) once all remote copies are updated, you call this function with the update_id that
 	///     completed, and once it is the latest the Channel will be re-enabled.
 	pub fn channel_monitor_updated(&self, funding_txo: &OutPoint, highest_applied_update_id: u64) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		let mut close_results = Vec::new();
 		let mut htlc_forwards = Vec::new();
@@ -2342,6 +2475,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 	fn internal_funding_created(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingCreated) -> Result<(), MsgHandleErrInternal> {
 		let ((funding_msg, monitor), mut chan) = {
+			let last_block_hash = *self.last_block_hash.read().unwrap();
 			let mut channel_lock = self.channel_state.lock().unwrap();
 			let channel_state = &mut *channel_lock;
 			match channel_state.by_id.entry(msg.temporary_channel_id.clone()) {
@@ -2349,7 +2483,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					if chan.get().get_counterparty_node_id() != *counterparty_node_id {
 						return Err(MsgHandleErrInternal::send_err_msg_no_close("Got a message for a channel from the wrong node!".to_owned(), msg.temporary_channel_id));
 					}
-					(try_chan_entry!(self, chan.get_mut().funding_created(msg, &self.logger), channel_state, chan), chan.remove())
+					(try_chan_entry!(self, chan.get_mut().funding_created(msg, last_block_hash, &self.logger), channel_state, chan), chan.remove())
 				},
 				hash_map::Entry::Vacant(_) => return Err(MsgHandleErrInternal::send_err_msg_no_close("Failed to find corresponding channel".to_owned(), msg.temporary_channel_id))
 			}
@@ -2366,7 +2500,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					// We do not do a force-close here as that would generate a monitor update for
 					// a monitor that we didn't manage to store (and that we don't care about - we
 					// don't respond with the funding_signed so the channel can never go on chain).
-					let (_funding_txo_option, _monitor_update, failed_htlcs) = chan.force_shutdown(true);
+					let (_monitor_update, failed_htlcs) = chan.force_shutdown(true);
 					assert!(failed_htlcs.is_empty());
 					return Err(MsgHandleErrInternal::send_err_msg_no_close("ChannelMonitor storage failure".to_owned(), funding_msg.channel_id));
 				},
@@ -2398,6 +2532,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 	fn internal_funding_signed(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingSigned) -> Result<(), MsgHandleErrInternal> {
 		let (funding_txo, user_id) = {
+			let last_block_hash = *self.last_block_hash.read().unwrap();
 			let mut channel_lock = self.channel_state.lock().unwrap();
 			let channel_state = &mut *channel_lock;
 			match channel_state.by_id.entry(msg.channel_id) {
@@ -2405,7 +2540,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					if chan.get().get_counterparty_node_id() != *counterparty_node_id {
 						return Err(MsgHandleErrInternal::send_err_msg_no_close("Got a message for a channel from the wrong node!".to_owned(), msg.channel_id));
 					}
-					let monitor = match chan.get_mut().funding_signed(&msg, &self.logger) {
+					let monitor = match chan.get_mut().funding_signed(&msg, last_block_hash, &self.logger) {
 						Ok(update) => update,
 						Err(e) => try_chan_entry!(self, Err(e), channel_state, chan),
 					};
@@ -2456,7 +2591,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		}
 	}
 
-	fn internal_shutdown(&self, counterparty_node_id: &PublicKey, msg: &msgs::Shutdown) -> Result<(), MsgHandleErrInternal> {
+	fn internal_shutdown(&self, counterparty_node_id: &PublicKey, their_features: &InitFeatures, msg: &msgs::Shutdown) -> Result<(), MsgHandleErrInternal> {
 		let (mut dropped_htlcs, chan_option) = {
 			let mut channel_state_lock = self.channel_state.lock().unwrap();
 			let channel_state = &mut *channel_state_lock;
@@ -2466,7 +2601,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					if chan_entry.get().get_counterparty_node_id() != *counterparty_node_id {
 						return Err(MsgHandleErrInternal::send_err_msg_no_close("Got a message for a channel from the wrong node!".to_owned(), msg.channel_id));
 					}
-					let (shutdown, closing_signed, dropped_htlcs) = try_chan_entry!(self, chan_entry.get_mut().shutdown(&self.fee_estimator, &msg), channel_state, chan_entry);
+					let (shutdown, closing_signed, dropped_htlcs) = try_chan_entry!(self, chan_entry.get_mut().shutdown(&self.fee_estimator, &their_features, &msg), channel_state, chan_entry);
 					if let Some(msg) = shutdown {
 						channel_state.pending_msg_events.push(events::MessageSendEvent::SendShutdown {
 							node_id: counterparty_node_id.clone(),
@@ -2568,7 +2703,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 					return Err(MsgHandleErrInternal::send_err_msg_no_close("Got a message for a channel from the wrong node!".to_owned(), msg.channel_id));
 				}
 
-				let create_pending_htlc_status = |chan: &Channel<ChanSigner>, pending_forward_info: PendingHTLCStatus, error_code: u16| {
+				let create_pending_htlc_status = |chan: &Channel<Signer>, pending_forward_info: PendingHTLCStatus, error_code: u16| {
 					// Ensure error_code has the UPDATE flag set, since by default we send a
 					// channel update along as part of failing the HTLC.
 					assert!((error_code & 0x1000) != 0);
@@ -2878,6 +3013,29 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 		Ok(())
 	}
 
+	fn internal_channel_update(&self, counterparty_node_id: &PublicKey, msg: &msgs::ChannelUpdate) -> Result<(), MsgHandleErrInternal> {
+		let mut channel_state_lock = self.channel_state.lock().unwrap();
+		let channel_state = &mut *channel_state_lock;
+		let chan_id = match channel_state.short_to_id.get(&msg.contents.short_channel_id) {
+			Some(chan_id) => chan_id.clone(),
+			None => {
+				// It's not a local channel
+				return Ok(())
+			}
+		};
+		match channel_state.by_id.entry(chan_id) {
+			hash_map::Entry::Occupied(mut chan) => {
+				if chan.get().get_counterparty_node_id() != *counterparty_node_id {
+					// TODO: see issue #153, need a consistent behavior on obnoxious behavior from random node
+					return Err(MsgHandleErrInternal::send_err_msg_no_close("Got a message for a channel from the wrong node!".to_owned(), chan_id));
+				}
+				try_chan_entry!(self, chan.get_mut().channel_update(&msg), channel_state, chan);
+			},
+			hash_map::Entry::Vacant(_) => unreachable!()
+		}
+		Ok(())
+	}
+
 	fn internal_channel_reestablish(&self, counterparty_node_id: &PublicKey, msg: &msgs::ChannelReestablish) -> Result<(), MsgHandleErrInternal> {
 		let mut channel_state_lock = self.channel_state.lock().unwrap();
 		let channel_state = &mut *channel_state_lock;
@@ -2959,7 +3117,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// (C-not exported) Cause its doc(hidden) anyway
 	#[doc(hidden)]
 	pub fn update_fee(&self, channel_id: [u8;32], feerate_per_kw: u32) -> Result<(), APIError> {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let counterparty_node_id;
 		let err: Result<(), _> = loop {
 			let mut channel_state_lock = self.channel_state.lock().unwrap();
@@ -3048,12 +3206,35 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 			self.finish_force_close_channel(failure);
 		}
 	}
+
+	/// Handle a list of channel failures during a block_connected or block_disconnected call,
+	/// pushing the channel monitor update (if any) to the background events queue and removing the
+	/// Channel object.
+	fn handle_init_event_channel_failures(&self, mut failed_channels: Vec<ShutdownResult>) {
+		for mut failure in failed_channels.drain(..) {
+			// Either a commitment transactions has been confirmed on-chain or
+			// Channel::block_disconnected detected that the funding transaction has been
+			// reorganized out of the main chain.
+			// We cannot broadcast our latest local state via monitor update (as
+			// Channel::force_shutdown tries to make us do) as we may still be in initialization,
+			// so we track the update internally and handle it when the user next calls
+			// timer_chan_freshness_every_min, guaranteeing we're running normally.
+			if let Some((funding_txo, update)) = failure.0.take() {
+				assert_eq!(update.updates.len(), 1);
+				if let ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast } = update.updates[0] {
+					assert!(should_broadcast);
+				} else { unreachable!(); }
+				self.pending_background_events.lock().unwrap().push(BackgroundEvent::ClosingMonitorUpdate((funding_txo, update)));
+			}
+			self.finish_force_close_channel(failure);
+		}
+	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> MessageSendEventsProvider for ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> MessageSendEventsProvider for ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
 				L::Target: Logger,
 {
@@ -3069,10 +3250,10 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> EventsProvider for ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> EventsProvider for ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
 				L::Target: Logger,
 {
@@ -3088,18 +3269,48 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> chain::Listen for ChannelManager<Signer, M, T, K, F, L>
+where
+	M::Target: chain::Watch<Signer>,
+	T::Target: BroadcasterInterface,
+	K::Target: KeysInterface<Signer = Signer>,
+	F::Target: FeeEstimator,
+	L::Target: Logger,
+{
+	fn block_connected(&self, block: &Block, height: u32) {
+		let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
+		ChannelManager::block_connected(self, &block.header, &txdata, height);
+	}
+
+	fn block_disconnected(&self, header: &BlockHeader, _height: u32) {
+		ChannelManager::block_disconnected(self, header);
+	}
+}
+
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
 	/// Updates channel state based on transactions seen in a connected block.
 	pub fn block_connected(&self, header: &BlockHeader, txdata: &TransactionData, height: u32) {
-		let header_hash = header.block_hash();
-		log_trace!(self.logger, "Block {} at height {} connected", header_hash, height);
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		// Note that we MUST NOT end up calling methods on self.chain_monitor here - we're called
+		// during initialization prior to the chain_monitor being fully configured in some cases.
+		// See the docs for `ChannelManagerReadArgs` for more.
+		let block_hash = header.block_hash();
+		log_trace!(self.logger, "Block {} at height {} connected", block_hash, height);
+
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+
+		assert_eq!(*self.last_block_hash.read().unwrap(), header.prev_blockhash,
+			"Blocks must be connected in chain-order - the connected header must build on the last connected header");
+		assert_eq!(self.latest_block_height.load(Ordering::Acquire) as u64, height as u64 - 1,
+			"Blocks must be connected in chain-order - the connected header must build on the last connected header");
+		self.latest_block_height.store(height as usize, Ordering::Release);
+		*self.last_block_hash.write().unwrap() = block_hash;
+
 		let mut failed_channels = Vec::new();
 		let mut timed_out_htlcs = Vec::new();
 		{
@@ -3148,9 +3359,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 								if let Some(short_id) = channel.get_short_channel_id() {
 									short_to_id.remove(&short_id);
 								}
-								// It looks like our counterparty went on-chain. We go ahead and
-								// broadcast our latest local state as well here, just in case its
-								// some kind of SPV attack, though we expect these to be dropped.
+								// It looks like our counterparty went on-chain. Close the channel.
 								failed_channels.push(channel.force_shutdown(true));
 								if let Ok(update) = self.get_channel_update(&channel) {
 									pending_msg_events.push(events::MessageSendEvent::BroadcastChannelUpdate {
@@ -3184,15 +3393,13 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 				!htlcs.is_empty() // Only retain this entry if htlcs has at least one entry.
 			});
 		}
-		for failure in failed_channels.drain(..) {
-			self.finish_force_close_channel(failure);
-		}
+
+		self.handle_init_event_channel_failures(failed_channels);
 
 		for (source, payment_hash, reason) in timed_out_htlcs.drain(..) {
 			self.fail_htlc_backwards_internal(self.channel_state.lock().unwrap(), source, &payment_hash, reason);
 		}
-		self.latest_block_height.store(height as usize, Ordering::Release);
-		*self.last_block_hash.try_lock().expect("block_(dis)connected must not be called in parallel") = header_hash;
+
 		loop {
 			// Update last_node_announcement_serial to be the max of its current value and the
 			// block timestamp. This should keep us close to the current time without relying on
@@ -3212,7 +3419,16 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 	/// If necessary, the channel may be force-closed without letting the counterparty participate
 	/// in the shutdown.
 	pub fn block_disconnected(&self, header: &BlockHeader) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		// Note that we MUST NOT end up calling methods on self.chain_monitor here - we're called
+		// during initialization prior to the chain_monitor being fully configured in some cases.
+		// See the docs for `ChannelManagerReadArgs` for more.
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+
+		assert_eq!(*self.last_block_hash.read().unwrap(), header.block_hash(),
+			"Blocks must be disconnected in chain-order - the disconnected header must be the last connected header");
+		self.latest_block_height.fetch_sub(1, Ordering::AcqRel);
+		*self.last_block_hash.write().unwrap() = header.prev_blockhash;
+
 		let mut failed_channels = Vec::new();
 		{
 			let mut channel_lock = self.channel_state.lock().unwrap();
@@ -3236,104 +3452,131 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 				}
 			});
 		}
-		for failure in failed_channels.drain(..) {
-			self.finish_force_close_channel(failure);
-		}
-		self.latest_block_height.fetch_sub(1, Ordering::AcqRel);
-		*self.last_block_hash.try_lock().expect("block_(dis)connected must not be called in parallel") = header.block_hash();
+
+		self.handle_init_event_channel_failures(failed_channels);
+	}
+
+	/// Blocks until ChannelManager needs to be persisted or a timeout is reached. It returns a bool
+	/// indicating whether persistence is necessary. Only one listener on
+	/// `await_persistable_update` or `await_persistable_update_timeout` is guaranteed to be woken
+	/// up.
+	/// Note that the feature `allow_wallclock_use` must be enabled to use this function.
+	#[cfg(any(test, feature = "allow_wallclock_use"))]
+	pub fn await_persistable_update_timeout(&self, max_wait: Duration) -> bool {
+		self.persistence_notifier.wait_timeout(max_wait)
+	}
+
+	/// Blocks until ChannelManager needs to be persisted. Only one listener on
+	/// `await_persistable_update` or `await_persistable_update_timeout` is guaranteed to be woken
+	/// up.
+	pub fn await_persistable_update(&self) {
+		self.persistence_notifier.wait()
+	}
+
+	#[cfg(any(test, feature = "_test_utils"))]
+	pub fn get_persistence_condvar_value(&self) -> bool {
+		let mutcond = &self.persistence_notifier.persistence_lock;
+		let &(ref mtx, _) = mutcond;
+		let guard = mtx.lock().unwrap();
+		*guard
 	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref + Sync + Send, T: Deref + Sync + Send, K: Deref + Sync + Send, F: Deref + Sync + Send, L: Deref + Sync + Send>
-	ChannelMessageHandler for ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref + Sync + Send, T: Deref + Sync + Send, K: Deref + Sync + Send, F: Deref + Sync + Send, L: Deref + Sync + Send>
+	ChannelMessageHandler for ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
 	fn handle_open_channel(&self, counterparty_node_id: &PublicKey, their_features: InitFeatures, msg: &msgs::OpenChannel) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_open_channel(counterparty_node_id, their_features, msg), *counterparty_node_id);
 	}
 
 	fn handle_accept_channel(&self, counterparty_node_id: &PublicKey, their_features: InitFeatures, msg: &msgs::AcceptChannel) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_accept_channel(counterparty_node_id, their_features, msg), *counterparty_node_id);
 	}
 
 	fn handle_funding_created(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingCreated) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_funding_created(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_funding_signed(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingSigned) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_funding_signed(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_funding_locked(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingLocked) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_funding_locked(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
-	fn handle_shutdown(&self, counterparty_node_id: &PublicKey, msg: &msgs::Shutdown) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
-		let _ = handle_error!(self, self.internal_shutdown(counterparty_node_id, msg), *counterparty_node_id);
+	fn handle_shutdown(&self, counterparty_node_id: &PublicKey, their_features: &InitFeatures, msg: &msgs::Shutdown) {
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+		let _ = handle_error!(self, self.internal_shutdown(counterparty_node_id, their_features, msg), *counterparty_node_id);
 	}
 
 	fn handle_closing_signed(&self, counterparty_node_id: &PublicKey, msg: &msgs::ClosingSigned) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_closing_signed(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_update_add_htlc(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateAddHTLC) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_update_add_htlc(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_update_fulfill_htlc(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateFulfillHTLC) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_update_fulfill_htlc(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_update_fail_htlc(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateFailHTLC) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_update_fail_htlc(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_update_fail_malformed_htlc(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateFailMalformedHTLC) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_update_fail_malformed_htlc(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_commitment_signed(&self, counterparty_node_id: &PublicKey, msg: &msgs::CommitmentSigned) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_commitment_signed(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_revoke_and_ack(&self, counterparty_node_id: &PublicKey, msg: &msgs::RevokeAndACK) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_revoke_and_ack(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_update_fee(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateFee) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_update_fee(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn handle_announcement_signatures(&self, counterparty_node_id: &PublicKey, msg: &msgs::AnnouncementSignatures) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_announcement_signatures(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
+	fn handle_channel_update(&self, counterparty_node_id: &PublicKey, msg: &msgs::ChannelUpdate) {
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
+		let _ = handle_error!(self, self.internal_channel_update(counterparty_node_id, msg), *counterparty_node_id);
+	}
+
 	fn handle_channel_reestablish(&self, counterparty_node_id: &PublicKey, msg: &msgs::ChannelReestablish) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let _ = handle_error!(self, self.internal_channel_reestablish(counterparty_node_id, msg), *counterparty_node_id);
 	}
 
 	fn peer_disconnected(&self, counterparty_node_id: &PublicKey, no_connection_possible: bool) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 		let mut failed_channels = Vec::new();
 		let mut failed_payments = Vec::new();
 		let mut no_channels_remain = true;
@@ -3406,6 +3649,7 @@ impl<ChanSigner: ChannelKeys, M: Deref + Sync + Send, T: Deref + Sync + Send, K:
 					&events::MessageSendEvent::PaymentFailureNetworkUpdate { .. } => true,
 					&events::MessageSendEvent::SendChannelRangeQuery { .. } => false,
 					&events::MessageSendEvent::SendShortIdsQuery { .. } => false,
+					&events::MessageSendEvent::SendReplyChannelRange { .. } => false,
 				}
 			});
 		}
@@ -3426,7 +3670,7 @@ impl<ChanSigner: ChannelKeys, M: Deref + Sync + Send, T: Deref + Sync + Send, K:
 	fn peer_connected(&self, counterparty_node_id: &PublicKey, init_msg: &msgs::Init) {
 		log_debug!(self.logger, "Generating channel_reestablish events for {}", log_pubkey!(counterparty_node_id));
 
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		{
 			let mut peer_state_lock = self.per_peer_state.write().unwrap();
@@ -3466,17 +3710,82 @@ impl<ChanSigner: ChannelKeys, M: Deref + Sync + Send, T: Deref + Sync + Send, K:
 	}
 
 	fn handle_error(&self, counterparty_node_id: &PublicKey, msg: &msgs::ErrorMessage) {
-		let _consistency_lock = self.total_consistency_lock.read().unwrap();
+		let _persistence_guard = PersistenceNotifierGuard::new(&self.total_consistency_lock, &self.persistence_notifier);
 
 		if msg.channel_id == [0; 32] {
 			for chan in self.list_channels() {
 				if chan.remote_network_id == *counterparty_node_id {
-					self.force_close_channel(&chan.channel_id);
+					// Untrusted messages from peer, we throw away the error if id points to a non-existent channel
+					let _ = self.force_close_channel_with_peer(&chan.channel_id, Some(counterparty_node_id));
 				}
 			}
 		} else {
-			self.force_close_channel(&msg.channel_id);
+			// Untrusted messages from peer, we throw away the error if id points to a non-existent channel
+			let _ = self.force_close_channel_with_peer(&msg.channel_id, Some(counterparty_node_id));
 		}
+	}
+}
+
+/// Used to signal to the ChannelManager persister that the manager needs to be re-persisted to
+/// disk/backups, through `await_persistable_update_timeout` and `await_persistable_update`.
+struct PersistenceNotifier {
+	/// Users won't access the persistence_lock directly, but rather wait on its bool using
+	/// `wait_timeout` and `wait`.
+	persistence_lock: (Mutex<bool>, Condvar),
+}
+
+impl PersistenceNotifier {
+	fn new() -> Self {
+		Self {
+			persistence_lock: (Mutex::new(false), Condvar::new()),
+		}
+	}
+
+	fn wait(&self) {
+		loop {
+			let &(ref mtx, ref cvar) = &self.persistence_lock;
+			let mut guard = mtx.lock().unwrap();
+			guard = cvar.wait(guard).unwrap();
+			let result = *guard;
+			if result {
+				*guard = false;
+				return
+			}
+		}
+	}
+
+	#[cfg(any(test, feature = "allow_wallclock_use"))]
+	fn wait_timeout(&self, max_wait: Duration) -> bool {
+		let current_time = Instant::now();
+		loop {
+			let &(ref mtx, ref cvar) = &self.persistence_lock;
+			let mut guard = mtx.lock().unwrap();
+			guard = cvar.wait_timeout(guard, max_wait).unwrap().0;
+			// Due to spurious wakeups that can happen on `wait_timeout`, here we need to check if the
+			// desired wait time has actually passed, and if not then restart the loop with a reduced wait
+			// time. Note that this logic can be highly simplified through the use of
+			// `Condvar::wait_while` and `Condvar::wait_timeout_while`, if and when our MSRV is raised to
+			// 1.42.0.
+			let elapsed = current_time.elapsed();
+			let result = *guard;
+			if result || elapsed >= max_wait {
+				*guard = false;
+				return result;
+			}
+			match max_wait.checked_sub(elapsed) {
+				None => return result,
+				Some(_) => continue
+			}
+		}
+	}
+
+	// Signal to the ChannelManager persister that there are updates necessitating persisting to disk.
+	fn notify(&self) {
+		let &(ref persist_mtx, ref cnd) = &self.persistence_lock;
+		let mut persistence_lock = persist_mtx.lock().unwrap();
+		*persistence_lock = true;
+		mem::drop(persistence_lock);
+		cnd.notify_all();
 	}
 }
 
@@ -3693,10 +4002,10 @@ impl Readable for HTLCForwardInfo {
 	}
 }
 
-impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> Writeable for ChannelManager<ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> Writeable for ChannelManager<Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
@@ -3708,7 +4017,7 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 
 		self.genesis_hash.write(writer)?;
 		(self.latest_block_height.load(Ordering::Acquire) as u32).write(writer)?;
-		self.last_block_hash.lock().unwrap().write(writer)?;
+		self.last_block_hash.read().unwrap().write(writer)?;
 
 		let channel_state = self.channel_state.lock().unwrap();
 		let mut unfunded_channels = 0;
@@ -3756,6 +4065,18 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 			event.write(writer)?;
 		}
 
+		let background_events = self.pending_background_events.lock().unwrap();
+		(background_events.len() as u64).write(writer)?;
+		for event in background_events.iter() {
+			match event {
+				BackgroundEvent::ClosingMonitorUpdate((funding_txo, monitor_update)) => {
+					0u8.write(writer)?;
+					funding_txo.write(writer)?;
+					monitor_update.write(writer)?;
+				},
+			}
+		}
+
 		(self.last_node_announcement_serial.load(Ordering::Acquire) as u32).write(writer)?;
 
 		Ok(())
@@ -3767,19 +4088,30 @@ impl<ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> 
 /// At a high-level, the process for deserializing a ChannelManager and resuming normal operation
 /// is:
 /// 1) Deserialize all stored ChannelMonitors.
-/// 2) Deserialize the ChannelManager by filling in this struct and calling <(Sha256dHash,
-///    ChannelManager)>::read(reader, args).
+/// 2) Deserialize the ChannelManager by filling in this struct and calling:
+///    <(BlockHash, ChannelManager)>::read(reader, args)
 ///    This may result in closing some Channels if the ChannelMonitor is newer than the stored
 ///    ChannelManager state to ensure no loss of funds. Thus, transactions may be broadcasted.
-/// 3) Register all relevant ChannelMonitor outpoints with your chain watch mechanism using
-///    ChannelMonitor::get_outputs_to_watch() and ChannelMonitor::get_funding_txo().
+/// 3) If you are not fetching full blocks, register all relevant ChannelMonitor outpoints the same
+///    way you would handle a `chain::Filter` call using ChannelMonitor::get_outputs_to_watch() and
+///    ChannelMonitor::get_funding_txo().
 /// 4) Reconnect blocks on your ChannelMonitors.
-/// 5) Move the ChannelMonitors into your local chain::Watch.
-/// 6) Disconnect/connect blocks on the ChannelManager.
-pub struct ChannelManagerReadArgs<'a, ChanSigner: 'a + ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+/// 5) Disconnect/connect blocks on the ChannelManager.
+/// 6) Move the ChannelMonitors into your local chain::Watch.
+///
+/// Note that the ordering of #4-6 is not of importance, however all three must occur before you
+/// call any other methods on the newly-deserialized ChannelManager.
+///
+/// Note that because some channels may be closed during deserialization, it is critical that you
+/// always deserialize only the latest version of a ChannelManager and ChannelMonitors available to
+/// you. If you deserialize an old ChannelManager (during which force-closure transactions may be
+/// broadcast), and then later deserialize a newer version of the same ChannelManager (which will
+/// not force-close the same channels but consider them live), you may end up revoking a state for
+/// which you've already broadcasted the transaction.
+pub struct ChannelManagerReadArgs<'a, Signer: 'a + Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
@@ -3822,14 +4154,14 @@ pub struct ChannelManagerReadArgs<'a, ChanSigner: 'a + ChannelKeys, M: Deref, T:
 	/// this struct.
 	///
 	/// (C-not exported) because we have no HashMap bindings
-	pub channel_monitors: HashMap<OutPoint, &'a mut ChannelMonitor<ChanSigner>>,
+	pub channel_monitors: HashMap<OutPoint, &'a mut ChannelMonitor<Signer>>,
 }
 
-impl<'a, ChanSigner: 'a + ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-		ChannelManagerReadArgs<'a, ChanSigner, M, T, K, F, L>
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<'a, Signer: 'a + Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
+		ChannelManagerReadArgs<'a, Signer, M, T, K, F, L>
+	where M::Target: chain::Watch<Signer>,
 		T::Target: BroadcasterInterface,
-		K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+		K::Target: KeysInterface<Signer = Signer>,
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
@@ -3837,7 +4169,7 @@ impl<'a, ChanSigner: 'a + ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L
 	/// HashMap for you. This is primarily useful for C bindings where it is not practical to
 	/// populate a HashMap directly from C.
 	pub fn new(keys_manager: K, fee_estimator: F, chain_monitor: M, tx_broadcaster: T, logger: L, default_config: UserConfig,
-			mut channel_monitors: Vec<&'a mut ChannelMonitor<ChanSigner>>) -> Self {
+			mut channel_monitors: Vec<&'a mut ChannelMonitor<Signer>>) -> Self {
 		Self {
 			keys_manager, fee_estimator, chain_monitor, tx_broadcaster, logger, default_config,
 			channel_monitors: channel_monitors.drain(..).map(|monitor| { (monitor.get_funding_txo().0, monitor) }).collect()
@@ -3847,29 +4179,29 @@ impl<'a, ChanSigner: 'a + ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L
 
 // Implement ReadableArgs for an Arc'd ChannelManager to make it a bit easier to work with the
 // SipmleArcChannelManager type:
-impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-	ReadableArgs<ChannelManagerReadArgs<'a, ChanSigner, M, T, K, F, L>> for (BlockHash, Arc<ChannelManager<ChanSigner, M, T, K, F, L>>)
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<'a, Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
+	ReadableArgs<ChannelManagerReadArgs<'a, Signer, M, T, K, F, L>> for (BlockHash, Arc<ChannelManager<Signer, M, T, K, F, L>>)
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
-	fn read<R: ::std::io::Read>(reader: &mut R, args: ChannelManagerReadArgs<'a, ChanSigner, M, T, K, F, L>) -> Result<Self, DecodeError> {
-		let (blockhash, chan_manager) = <(BlockHash, ChannelManager<ChanSigner, M, T, K, F, L>)>::read(reader, args)?;
+	fn read<R: ::std::io::Read>(reader: &mut R, args: ChannelManagerReadArgs<'a, Signer, M, T, K, F, L>) -> Result<Self, DecodeError> {
+		let (blockhash, chan_manager) = <(BlockHash, ChannelManager<Signer, M, T, K, F, L>)>::read(reader, args)?;
 		Ok((blockhash, Arc::new(chan_manager)))
 	}
 }
 
-impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-	ReadableArgs<ChannelManagerReadArgs<'a, ChanSigner, M, T, K, F, L>> for (BlockHash, ChannelManager<ChanSigner, M, T, K, F, L>)
-	where M::Target: chain::Watch<Keys=ChanSigner>,
+impl<'a, Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
+	ReadableArgs<ChannelManagerReadArgs<'a, Signer, M, T, K, F, L>> for (BlockHash, ChannelManager<Signer, M, T, K, F, L>)
+	where M::Target: chain::Watch<Signer>,
         T::Target: BroadcasterInterface,
-        K::Target: KeysInterface<ChanKeySigner = ChanSigner>,
+        K::Target: KeysInterface<Signer = Signer>,
         F::Target: FeeEstimator,
         L::Target: Logger,
 {
-	fn read<R: ::std::io::Read>(reader: &mut R, mut args: ChannelManagerReadArgs<'a, ChanSigner, M, T, K, F, L>) -> Result<Self, DecodeError> {
+	fn read<R: ::std::io::Read>(reader: &mut R, mut args: ChannelManagerReadArgs<'a, Signer, M, T, K, F, L>) -> Result<Self, DecodeError> {
 		let _ver: u8 = Readable::read(reader)?;
 		let min_ver: u8 = Readable::read(reader)?;
 		if min_ver > SERIALIZATION_VERSION {
@@ -3887,11 +4219,7 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 		let mut by_id = HashMap::with_capacity(cmp::min(channel_count as usize, 128));
 		let mut short_to_id = HashMap::with_capacity(cmp::min(channel_count as usize, 128));
 		for _ in 0..channel_count {
-			let mut channel: Channel<ChanSigner> = Channel::read(reader, &args.keys_manager)?;
-			if channel.last_block_connected != Default::default() && channel.last_block_connected != last_block_hash {
-				return Err(DecodeError::InvalidValue);
-			}
-
+			let mut channel: Channel<Signer> = Channel::read(reader, &args.keys_manager)?;
 			let funding_txo = channel.get_funding_txo().ok_or(DecodeError::InvalidValue)?;
 			funding_txo_set.insert(funding_txo.clone());
 			if let Some(ref mut monitor) = args.channel_monitors.get_mut(&funding_txo) {
@@ -3906,7 +4234,7 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 						channel.get_cur_counterparty_commitment_transaction_number() > monitor.get_cur_counterparty_commitment_number() ||
 						channel.get_latest_monitor_update_id() < monitor.get_latest_update_id() {
 					// But if the channel is behind of the monitor, close the channel:
-					let (_, _, mut new_failed_htlcs) = channel.force_shutdown(true);
+					let (_, mut new_failed_htlcs) = channel.force_shutdown(true);
 					failed_htlcs.append(&mut new_failed_htlcs);
 					monitor.broadcast_latest_holder_commitment_txn(&args.tx_broadcaster, &args.logger);
 				} else {
@@ -3970,7 +4298,19 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 			}
 		}
 
+		let background_event_count: u64 = Readable::read(reader)?;
+		let mut pending_background_events_read: Vec<BackgroundEvent> = Vec::with_capacity(cmp::min(background_event_count as usize, MAX_ALLOC_SIZE/mem::size_of::<BackgroundEvent>()));
+		for _ in 0..background_event_count {
+			match <u8 as Readable>::read(reader)? {
+				0 => pending_background_events_read.push(BackgroundEvent::ClosingMonitorUpdate((Readable::read(reader)?, Readable::read(reader)?))),
+				_ => return Err(DecodeError::InvalidValue),
+			}
+		}
+
 		let last_node_announcement_serial: u32 = Readable::read(reader)?;
+
+		let mut secp_ctx = Secp256k1::new();
+		secp_ctx.seeded_randomize(&args.keys_manager.get_secure_random_bytes());
 
 		let channel_manager = ChannelManager {
 			genesis_hash,
@@ -3979,8 +4319,7 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 			tx_broadcaster: args.tx_broadcaster,
 
 			latest_block_height: AtomicUsize::new(latest_block_height as usize),
-			last_block_hash: Mutex::new(last_block_hash),
-			secp_ctx: Secp256k1::new(),
+			last_block_hash: RwLock::new(last_block_hash),
 
 			channel_state: Mutex::new(ChannelHolder {
 				by_id,
@@ -3990,13 +4329,18 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 				pending_msg_events: Vec::new(),
 			}),
 			our_network_key: args.keys_manager.get_node_secret(),
+			our_network_pubkey: PublicKey::from_secret_key(&secp_ctx, &args.keys_manager.get_node_secret()),
+			secp_ctx,
 
 			last_node_announcement_serial: AtomicUsize::new(last_node_announcement_serial as usize),
 
 			per_peer_state: RwLock::new(per_peer_state),
 
 			pending_events: Mutex::new(pending_events_read),
+			pending_background_events: Mutex::new(pending_background_events_read),
 			total_consistency_lock: RwLock::new(()),
+			persistence_notifier: PersistenceNotifier::new(),
+
 			keys_manager: args.keys_manager,
 			logger: args.logger,
 			default_configuration: args.default_config,
@@ -4010,5 +4354,207 @@ impl<'a, ChanSigner: ChannelKeys, M: Deref, T: Deref, K: Deref, F: Deref, L: Der
 		//connection or two.
 
 		Ok((last_block_hash.clone(), channel_manager))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use ln::channelmanager::PersistenceNotifier;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::thread;
+	use std::time::Duration;
+
+	#[test]
+	fn test_wait_timeout() {
+		let persistence_notifier = Arc::new(PersistenceNotifier::new());
+		let thread_notifier = Arc::clone(&persistence_notifier);
+
+		let exit_thread = Arc::new(AtomicBool::new(false));
+		let exit_thread_clone = exit_thread.clone();
+		thread::spawn(move || {
+			loop {
+				let &(ref persist_mtx, ref cnd) = &thread_notifier.persistence_lock;
+				let mut persistence_lock = persist_mtx.lock().unwrap();
+				*persistence_lock = true;
+				cnd.notify_all();
+
+				if exit_thread_clone.load(Ordering::SeqCst) {
+					break
+				}
+			}
+		});
+
+		// Check that we can block indefinitely until updates are available.
+		let _ = persistence_notifier.wait();
+
+		// Check that the PersistenceNotifier will return after the given duration if updates are
+		// available.
+		loop {
+			if persistence_notifier.wait_timeout(Duration::from_millis(100)) {
+				break
+			}
+		}
+
+		exit_thread.store(true, Ordering::SeqCst);
+
+		// Check that the PersistenceNotifier will return after the given duration even if no updates
+		// are available.
+		loop {
+			if !persistence_notifier.wait_timeout(Duration::from_millis(100)) {
+				break
+			}
+		}
+	}
+}
+
+#[cfg(all(any(test, feature = "_test_utils"), feature = "unstable"))]
+pub mod bench {
+	use chain::Listen;
+	use chain::chainmonitor::ChainMonitor;
+	use chain::channelmonitor::Persist;
+	use chain::keysinterface::{KeysManager, InMemorySigner};
+	use chain::transaction::OutPoint;
+	use ln::channelmanager::{ChainParameters, ChannelManager, PaymentHash, PaymentPreimage};
+	use ln::features::InitFeatures;
+	use ln::functional_test_utils::*;
+	use ln::msgs::ChannelMessageHandler;
+	use routing::network_graph::NetworkGraph;
+	use routing::router::get_route;
+	use util::test_utils;
+	use util::config::UserConfig;
+	use util::events::{Event, EventsProvider, MessageSendEvent, MessageSendEventsProvider};
+
+	use bitcoin::hashes::Hash;
+	use bitcoin::hashes::sha256::Hash as Sha256;
+	use bitcoin::{Block, BlockHeader, Transaction, TxOut};
+
+	use std::sync::Mutex;
+
+	use test::Bencher;
+
+	struct NodeHolder<'a, P: Persist<InMemorySigner>> {
+		node: &'a ChannelManager<InMemorySigner,
+			&'a ChainMonitor<InMemorySigner, &'a test_utils::TestChainSource,
+				&'a test_utils::TestBroadcaster, &'a test_utils::TestFeeEstimator,
+				&'a test_utils::TestLogger, &'a P>,
+			&'a test_utils::TestBroadcaster, &'a KeysManager,
+			&'a test_utils::TestFeeEstimator, &'a test_utils::TestLogger>
+	}
+
+	#[cfg(test)]
+	#[bench]
+	fn bench_sends(bench: &mut Bencher) {
+		bench_two_sends(bench, test_utils::TestPersister::new(), test_utils::TestPersister::new());
+	}
+
+	pub fn bench_two_sends<P: Persist<InMemorySigner>>(bench: &mut Bencher, persister_a: P, persister_b: P) {
+		// Do a simple benchmark of sending a payment back and forth between two nodes.
+		// Note that this is unrealistic as each payment send will require at least two fsync
+		// calls per node.
+		let network = bitcoin::Network::Testnet;
+		let genesis_hash = bitcoin::blockdata::constants::genesis_block(network).header.block_hash();
+
+		let tx_broadcaster = test_utils::TestBroadcaster{txn_broadcasted: Mutex::new(Vec::new())};
+		let fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: 253 };
+
+		let mut config: UserConfig = Default::default();
+		config.own_channel_config.minimum_depth = 1;
+
+		let logger_a = test_utils::TestLogger::with_id("node a".to_owned());
+		let chain_monitor_a = ChainMonitor::new(None, &tx_broadcaster, &logger_a, &fee_estimator, &persister_a);
+		let seed_a = [1u8; 32];
+		let keys_manager_a = KeysManager::new(&seed_a, 42, 42);
+		let node_a = ChannelManager::new(&fee_estimator, &chain_monitor_a, &tx_broadcaster, &logger_a, &keys_manager_a, config.clone(), ChainParameters {
+			network,
+			latest_hash: genesis_hash,
+			latest_height: 0,
+		});
+		let node_a_holder = NodeHolder { node: &node_a };
+
+		let logger_b = test_utils::TestLogger::with_id("node a".to_owned());
+		let chain_monitor_b = ChainMonitor::new(None, &tx_broadcaster, &logger_a, &fee_estimator, &persister_b);
+		let seed_b = [2u8; 32];
+		let keys_manager_b = KeysManager::new(&seed_b, 42, 42);
+		let node_b = ChannelManager::new(&fee_estimator, &chain_monitor_b, &tx_broadcaster, &logger_b, &keys_manager_b, config.clone(), ChainParameters {
+			network,
+			latest_hash: genesis_hash,
+			latest_height: 0,
+		});
+		let node_b_holder = NodeHolder { node: &node_b };
+
+		node_a.create_channel(node_b.get_our_node_id(), 8_000_000, 100_000_000, 42, None).unwrap();
+		node_b.handle_open_channel(&node_a.get_our_node_id(), InitFeatures::known(), &get_event_msg!(node_a_holder, MessageSendEvent::SendOpenChannel, node_b.get_our_node_id()));
+		node_a.handle_accept_channel(&node_b.get_our_node_id(), InitFeatures::known(), &get_event_msg!(node_b_holder, MessageSendEvent::SendAcceptChannel, node_a.get_our_node_id()));
+
+		let tx;
+		if let Event::FundingGenerationReady { temporary_channel_id, output_script, .. } = get_event!(node_a_holder, Event::FundingGenerationReady) {
+			tx = Transaction { version: 2, lock_time: 0, input: Vec::new(), output: vec![TxOut {
+				value: 8_000_000, script_pubkey: output_script,
+			}]};
+			let funding_outpoint = OutPoint { txid: tx.txid(), index: 0 };
+			node_a.funding_transaction_generated(&temporary_channel_id, funding_outpoint);
+		} else { panic!(); }
+
+		node_b.handle_funding_created(&node_a.get_our_node_id(), &get_event_msg!(node_a_holder, MessageSendEvent::SendFundingCreated, node_b.get_our_node_id()));
+		node_a.handle_funding_signed(&node_b.get_our_node_id(), &get_event_msg!(node_b_holder, MessageSendEvent::SendFundingSigned, node_a.get_our_node_id()));
+
+		get_event!(node_a_holder, Event::FundingBroadcastSafe);
+
+		let block = Block {
+			header: BlockHeader { version: 0x20000000, prev_blockhash: genesis_hash, merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 },
+			txdata: vec![tx],
+		};
+		Listen::block_connected(&node_a, &block, 1);
+		Listen::block_connected(&node_b, &block, 1);
+
+		node_a.handle_funding_locked(&node_b.get_our_node_id(), &get_event_msg!(node_b_holder, MessageSendEvent::SendFundingLocked, node_a.get_our_node_id()));
+		node_b.handle_funding_locked(&node_a.get_our_node_id(), &get_event_msg!(node_a_holder, MessageSendEvent::SendFundingLocked, node_b.get_our_node_id()));
+
+		let dummy_graph = NetworkGraph::new(genesis_hash);
+
+		macro_rules! send_payment {
+			($node_a: expr, $node_b: expr) => {
+				let usable_channels = $node_a.list_usable_channels();
+				let route = get_route(&$node_a.get_our_node_id(), &dummy_graph, &$node_b.get_our_node_id(), None, Some(&usable_channels.iter().map(|r| r).collect::<Vec<_>>()), &[], 10_000, TEST_FINAL_CLTV, &logger_a).unwrap();
+
+				let payment_preimage = PaymentPreimage([0; 32]);
+				let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0[..]).into_inner());
+
+				$node_a.send_payment(&route, payment_hash, &None).unwrap();
+				let payment_event = SendEvent::from_event($node_a.get_and_clear_pending_msg_events().pop().unwrap());
+				$node_b.handle_update_add_htlc(&$node_a.get_our_node_id(), &payment_event.msgs[0]);
+				$node_b.handle_commitment_signed(&$node_a.get_our_node_id(), &payment_event.commitment_msg);
+				let (raa, cs) = get_revoke_commit_msgs!(NodeHolder { node: &$node_b }, $node_a.get_our_node_id());
+				$node_a.handle_revoke_and_ack(&$node_b.get_our_node_id(), &raa);
+				$node_a.handle_commitment_signed(&$node_b.get_our_node_id(), &cs);
+				$node_b.handle_revoke_and_ack(&$node_a.get_our_node_id(), &get_event_msg!(NodeHolder { node: &$node_a }, MessageSendEvent::SendRevokeAndACK, $node_b.get_our_node_id()));
+
+				expect_pending_htlcs_forwardable!(NodeHolder { node: &$node_b });
+				expect_payment_received!(NodeHolder { node: &$node_b }, payment_hash, 10_000);
+				assert!($node_b.claim_funds(payment_preimage, &None, 10_000));
+
+				match $node_b.get_and_clear_pending_msg_events().pop().unwrap() {
+					MessageSendEvent::UpdateHTLCs { node_id, updates } => {
+						assert_eq!(node_id, $node_a.get_our_node_id());
+						$node_a.handle_update_fulfill_htlc(&$node_b.get_our_node_id(), &updates.update_fulfill_htlcs[0]);
+						$node_a.handle_commitment_signed(&$node_b.get_our_node_id(), &updates.commitment_signed);
+					},
+					_ => panic!("Failed to generate claim event"),
+				}
+
+				let (raa, cs) = get_revoke_commit_msgs!(NodeHolder { node: &$node_a }, $node_b.get_our_node_id());
+				$node_b.handle_revoke_and_ack(&$node_a.get_our_node_id(), &raa);
+				$node_b.handle_commitment_signed(&$node_a.get_our_node_id(), &cs);
+				$node_a.handle_revoke_and_ack(&$node_b.get_our_node_id(), &get_event_msg!(NodeHolder { node: &$node_b }, MessageSendEvent::SendRevokeAndACK, $node_a.get_our_node_id()));
+
+				expect_payment_sent!(NodeHolder { node: &$node_a }, payment_preimage);
+			}
+		}
+
+		bench.iter(|| {
+			send_payment!(node_a, node_b);
+			send_payment!(node_b, node_a);
+		});
 	}
 }
