@@ -7,6 +7,10 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+//! Useful macros for generating serialization related code.
+
+/// Encode a TLV
+#[macro_export]
 macro_rules! encode_tlv {
 	($stream: expr, $type: expr, $field: expr, required) => {
 		BigSize($type).write($stream)?;
@@ -72,6 +76,8 @@ macro_rules! get_varint_length_prefixed_tlv_length {
 	};
 }
 
+/// Encode a varint length prefixed TLV
+#[macro_export]
 macro_rules! encode_varint_length_prefixed_tlv {
 	($stream: expr, {$(($type: expr, $field: expr, $fieldty: ident)),*}) => { {
 		use util::ser::BigSize;
@@ -120,15 +126,17 @@ macro_rules! check_missing_tlv {
 	}};
 }
 
+/// Decode a TLV.
+#[macro_export]
 macro_rules! decode_tlv {
 	($reader: expr, $field: ident, required) => {{
-		$field = ser::Readable::read(&mut $reader)?;
+		$field = $crate::util::ser::Readable::read(&mut $reader)?;
 	}};
 	($reader: expr, $field: ident, vec_type) => {{
-		$field = Some(ser::Readable::read(&mut $reader)?);
+		$field = Some($crate::util::ser::Readable::read(&mut $reader)?);
 	}};
 	($reader: expr, $field: ident, option) => {{
-		$field = Some(ser::Readable::read(&mut $reader)?);
+		$field = Some($crate::util::ser::Readable::read(&mut $reader)?);
 	}};
 }
 

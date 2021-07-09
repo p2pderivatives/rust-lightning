@@ -303,7 +303,7 @@ impl Readable for U48 {
 /// encoded in several different ways, which we must check for at deserialization-time. Thus, if
 /// you're looking for an example of a variable-length integer to use for your own project, move
 /// along, this is a rather poor design.
-pub(crate) struct BigSize(pub u64);
+pub struct BigSize(pub u64);
 impl Writeable for BigSize {
 	#[inline]
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ::std::io::Error> {
@@ -486,6 +486,7 @@ impl_array!(16); // for IPv6
 impl_array!(32); // for channel id & hmac
 impl_array!(PUBLIC_KEY_SIZE); // for PublicKey
 impl_array!(COMPACT_SIGNATURE_SIZE); // for Signature
+impl_array!(162); // for ECDSA adaptor signatures
 impl_array!(1300); // for OnionPacket.hop_data
 
 // HashMap
