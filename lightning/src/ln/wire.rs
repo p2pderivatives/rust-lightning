@@ -55,7 +55,9 @@ pub enum Message {
 	ReplyChannelRange(msgs::ReplyChannelRange),
 	GossipTimestampFilter(msgs::GossipTimestampFilter),
 	/// A message that could not be decoded because its type is unknown.
-	Unknown(MessageType),
+	Unknown(u16),
+	/// A message that is handled by the unknown message handler.
+	HandledUnknown(u16),
 }
 
 /// A number identifying a message to determine how it is encoded on the wire.
@@ -95,7 +97,8 @@ impl Message {
 			&Message::QueryChannelRange(ref msg) => msg.type_id(),
 			&Message::ReplyChannelRange(ref msg) => msg.type_id(),
 			&Message::GossipTimestampFilter(ref msg) => msg.type_id(),
-			&Message::Unknown(type_id) => type_id,
+			&Message::Unknown(type_id) => MessageType(type_id),
+			&Message::HandledUnknown(type_id) => MessageType(type_id),
 		}
 	}
 }
@@ -207,7 +210,7 @@ pub fn read<R: ::std::io::Read>(buffer: &mut R) -> Result<Message, msgs::DecodeE
 			Ok(Message::GossipTimestampFilter(Readable::read(buffer)?))
 		},
 		_ => {
-			Ok(Message::Unknown(MessageType(message_type)))
+			Ok(Message::Unknown(message_type))
 		},
 	}
 }
@@ -349,6 +352,13 @@ impl Encode for msgs::GossipTimestampFilter {
 	const TYPE: u16 = 265;
 }
 
+// It'd be nice to be able to use a type provided by the custom message handler
+// but the const requirement makes it infeasible. Might also indicate that having
+// just an "UnknownMessage" is not the right approach.
+impl Encode for msgs::UnknownMessage {
+	const TYPE: u16 = 301;
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -403,7 +413,7 @@ mod tests {
 		let mut reader = ::std::io::Cursor::new(buffer);
 		let message = read(&mut reader).unwrap();
 		match message {
-			Message::Unknown(MessageType(::core::u16::MAX)) => (),
+			Message::Unknown(::core::u16::MAX) => (),
 			_ => panic!("Expected message type {}; found: {}", ::core::u16::MAX, message.type_id()),
 		}
 	}
@@ -439,13 +449,13 @@ mod tests {
 
 	#[test]
 	fn is_even_message_type() {
-		let message = Message::Unknown(MessageType(42));
+		let message = Message::Unknown(42);
 		assert!(message.type_id().is_even());
 	}
 
 	#[test]
 	fn is_odd_message_type() {
-		let message = Message::Unknown(MessageType(43));
+		let message = Message::Unknown(43);
 		assert!(!message.type_id().is_even());
 	}
 

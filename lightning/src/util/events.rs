@@ -433,6 +433,13 @@ pub enum MessageSendEvent {
 		node_id: PublicKey,
 		/// The reply_channel_range which should be sent.
 		msg: msgs::ReplyChannelRange,
+	},
+	/// Send a message not related to the LN protocol
+	SendUnknownMessage {
+		/// The node_id of this message recipient
+		node_id: PublicKey,
+		/// The unknown message that should be sent.
+		msg: msgs::UnknownMessage,
 	}
 }
 

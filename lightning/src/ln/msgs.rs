@@ -674,6 +674,16 @@ pub struct GossipTimestampFilter {
 	pub timestamp_range: u32,
 }
 
+/// An unknown_message is a message used to transmit information not related
+/// to the LN protocol
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnknownMessage {
+	/// The already serialized message.
+	// It would be better if there could be a callback for serializing and
+	// providing message type.
+	pub serialized: Vec<u8>,
+}
+
 /// Encoding type for data compression of collections in gossip queries.
 /// We do not support encoding_type=1 zlib serialization defined in BOLT #7.
 enum EncodingType {
@@ -1834,6 +1844,35 @@ impl Writeable for GossipTimestampFilter {
 		self.chain_hash.write(w)?;
 		self.first_timestamp.write(w)?;
 		self.timestamp_range.write(w)?;
+		Ok(())
+	}
+}
+
+
+impl Readable for UnknownMessage {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let len: u16 = Readable::read(r)?;
+
+		let mut serialized = Vec::with_capacity(len as usize);
+		for _ in 0..len {
+			serialized.push(Readable::read(r)?);
+		}
+
+		Ok(UnknownMessage {
+			serialized
+		})
+	}
+}
+
+impl Writeable for UnknownMessage {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		let len = self.serialized.len() as u16;
+		len.write(w)?;
+
+		for b in self.serialized.iter() {
+			b.write(w)?;
+		}
+
 		Ok(())
 	}
 }
